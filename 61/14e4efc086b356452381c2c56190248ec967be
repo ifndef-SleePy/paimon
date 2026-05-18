@@ -1,0 +1,25 @@
+paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/coordinator/SimpleWatermarkValve.java
+  efda2578bbf44f92 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "6114e4efc086b356452381c2c56190248ec967be",
+  "prompts": {
+    "efda2578bbf44f92": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "69e1b12717b68ce25230a4ef",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "liubiao.leo <liubiao.leo@bytedance.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 111,
+      "overriden_lines": 0
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
