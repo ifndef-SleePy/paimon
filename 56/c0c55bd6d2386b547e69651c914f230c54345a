@@ -1,0 +1,143 @@
+paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreCommitter.java
+  efda2578bbf44f92 55 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a0b08a93e948efab1551b10","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":55}]}]}
+paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/Committer.java
+  efda2578bbf44f92 23,86,101,114 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a0b08a93e948efab1551b10","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":23},{"Single":86},{"Single":101},{"Single":114}]}]}
+paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/CommitterMetrics.java
+  efda2578bbf44f92 26,28,39-55 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a0b08a93e948efab1551b10","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":26},{"Single":28},{"Range":[39,55]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "56c0c55bd6d2386b547e69651c914f230c54345a",
+  "prompts": {
+    "efda2578bbf44f92": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "69e1b12717b68ce25230a4ef",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "liubiao.leo <liubiao.leo@bytedance.com>",
+      "messages": [],
+      "total_additions": 24,
+      "total_deletions": 9,
+      "accepted_lines": 24,
+      "overriden_lines": 0
+    }
+  },
+  "attestation_metadata": {
+    "paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/Committer.java": [
+      {
+        "hash": "efda2578bbf44f92",
+        "line_ranges": [
+          {
+            "Single": 23
+          },
+          {
+            "Single": 86
+          },
+          {
+            "Single": 101
+          },
+          {
+            "Single": 114
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a0b08a93e948efab1551b10",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 23
+              },
+              {
+                "Single": 86
+              },
+              {
+                "Single": 101
+              },
+              {
+                "Single": 114
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/CommitterMetrics.java": [
+      {
+        "hash": "efda2578bbf44f92",
+        "line_ranges": [
+          {
+            "Single": 26
+          },
+          {
+            "Single": 28
+          },
+          {
+            "Range": [
+              39,
+              55
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a0b08a93e948efab1551b10",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 26
+              },
+              {
+                "Single": 28
+              },
+              {
+                "Range": [
+                  39,
+                  55
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreCommitter.java": [
+      {
+        "hash": "efda2578bbf44f92",
+        "line_ranges": [
+          {
+            "Single": 55
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a0b08a93e948efab1551b10",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 55
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "efda2578bbf44f92": {
+      "tool": "trae",
+      "conversation_id": "69e1b12717b68ce25230a4ef",
+      "session_id": "69e1b12717b68ce25230a4ef",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
