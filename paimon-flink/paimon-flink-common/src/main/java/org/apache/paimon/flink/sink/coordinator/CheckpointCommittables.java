@@ -35,19 +35,34 @@ public class CheckpointCommittables {
     // Idle bit is frozen at barrier time together with watermark; mirrors what Flink's
     // StatusWatermarkValve would have observed on the writer's input at the moment of the barrier.
     private final boolean idle;
+    // Whether the checkpoint that produced these committables is a Flink savepoint. Only the writer
+    // can observe this (via CheckpointOptions); it rides along so the JM-side coordinator, whose
+    // OperatorCoordinator API carries no savepoint indicator, can auto-tag the resulting snapshot.
+    private final boolean savepoint;
 
     public CheckpointCommittables(
-            long checkpointId, List<Committable> committables, long watermark, boolean idle) {
+            long checkpointId,
+            List<Committable> committables,
+            long watermark,
+            boolean idle,
+            boolean savepoint) {
         this.checkpointId = checkpointId;
         this.committables = committables;
         this.watermark = watermark;
         this.idle = idle;
+        this.savepoint = savepoint;
+    }
+
+    // Convenience for callers that are not savepoint-aware yet.
+    public CheckpointCommittables(
+            long checkpointId, List<Committable> committables, long watermark, boolean idle) {
+        this(checkpointId, committables, watermark, idle, false);
     }
 
     // Convenience for callers that only need the pre-idle-aware shape (ACTIVE writer).
     public CheckpointCommittables(
             long checkpointId, List<Committable> committables, long watermark) {
-        this(checkpointId, committables, watermark, false);
+        this(checkpointId, committables, watermark, false, false);
     }
 
     public long checkpointId() {
@@ -66,6 +81,15 @@ public class CheckpointCommittables {
         return idle;
     }
 
+    public boolean savepoint() {
+        return savepoint;
+    }
+
+    /** Returns a copy with the savepoint bit set; all other fields preserved. */
+    public CheckpointCommittables withSavepoint(boolean savepoint) {
+        return new CheckpointCommittables(checkpointId, committables, watermark, idle, savepoint);
+    }
+
     public int size() {
         return committables.size();
     }
@@ -77,7 +101,7 @@ public class CheckpointCommittables {
     @Override
     public String toString() {
         return String.format(
-                "CheckpointCommittables{checkpointId=%d, watermark=%d, idle=%s, committables=%s}",
-                checkpointId, watermark, idle, committables);
+                "CheckpointCommittables{checkpointId=%d, watermark=%d, idle=%s, savepoint=%s, committables=%s}",
+                checkpointId, watermark, idle, savepoint, committables);
     }
 }

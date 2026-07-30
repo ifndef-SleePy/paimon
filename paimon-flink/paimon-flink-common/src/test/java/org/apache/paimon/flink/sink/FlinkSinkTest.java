@@ -105,17 +105,14 @@ public class FlinkSinkTest extends CommitterOperatorTestBase {
     }
 
     @Test
-    public void testCoordinatorCommitPreconditionsRejectsAutoTagForSavepoint() throws Exception {
+    public void testCoordinatorCommitPreconditionsAllowsAutoTagForSavepoint() throws Exception {
         FileStoreTable table =
                 createUnawareBucketTable(
                         options ->
                                 options.set(
                                         FlinkConnectorOptions.SINK_AUTO_TAG_FOR_SAVEPOINT, true));
-        assertThatThrownBy(
-                        () ->
-                                FlinkSink.checkCoordinatorCommitPreconditions(
-                                        table, newCheckpointConfig(1), true))
-                .isInstanceOf(IllegalArgumentException.class);
+        // auto-tag-for-savepoint is now supported on the coordinator-commit path
+        FlinkSink.checkCoordinatorCommitPreconditions(table, newCheckpointConfig(1), true);
     }
 
     @Test

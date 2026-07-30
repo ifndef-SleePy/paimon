@@ -110,7 +110,17 @@ public class RowAppendTableSink extends AppendTableSink<InternalRow> {
         public OperatorCoordinator.Provider getCoordinatorProvider(
                 String operatorName, OperatorID operatorID) {
             return new CommittingWriteOperatorCoordinator.Provider(
-                    operatorID, committerFactory, streamingCheckpointEnabled, initialCommitUser);
+                    operatorID,
+                    committerFactory,
+                    streamingCheckpointEnabled,
+                    initialCommitUser,
+                    new Options(table.options())
+                            .get(FlinkConnectorOptions.SINK_AUTO_TAG_FOR_SAVEPOINT),
+                    table::snapshotManager,
+                    table::tagManager,
+                    () -> table.store().newTagDeletion(),
+                    () -> table.store().createTagCallbacks(table),
+                    table.coreOptions().tagDefaultTimeRetained());
         }
 
         @Override

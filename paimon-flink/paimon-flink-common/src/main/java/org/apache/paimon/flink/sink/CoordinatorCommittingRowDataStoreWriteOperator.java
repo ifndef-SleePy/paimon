@@ -33,9 +33,12 @@ import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.array.BytePrimitiveArraySerializer;
 import org.apache.flink.core.io.SimpleVersionedSerializerTypeSerializerProxy;
+import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.operators.coordination.OperatorEventGateway;
+import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
+import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
 import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.api.operators.util.SimpleVersionedListState;
 import org.apache.flink.streaming.api.watermark.Watermark;
@@ -159,22 +162,15 @@ public class CoordinatorCommittingRowDataStoreWriteOperator
     }
 
     @Override
-    public void notifyCheckpointComplete(long checkpointId) throws Exception {
-        super.notifyCheckpointComplete(checkpointId);
-        // operator state already persisted these; we no longer need to replay them on the next
-        // restore
-        pendingCommittables.headMap(checkpointId, true).clear();
-    }
-
-    @Override
     protected void emitCommittables(boolean waitCompaction, long checkpointId) throws IOException {
+        // Runs before the checkpoint barrier (via prepareSnapshotPreBarrier) and at end-of-input.
+        // Produces and buffers this checkpoint's committables and forwards them downstream, but does
+        // NOT report to the coordinator yet: at this point a savepoint is indistinguishable from a
+        // normal checkpoint. The report is deferred to snapshotState / endInput.
         List<Committable> committables = prepareCommit(waitCompaction, checkpointId);
         CheckpointCommittables entry =
                 new CheckpointCommittables(
                         checkpointId, committables, currentWatermark, currentIdle);
-        // Emit an event per (subtask, checkpoint) regardless of whether committables is empty.
-        operatorEventGateway.sendEventToCoordinator(
-                CommittableEvent.create(checkpointId, entry, eventSerializer));
         // Always buffer the per-checkpoint entry so an empty barrier — even one that has not seen
         // a real watermark yet — survives restore. The coordinator relies on every subtask
         // having an entry for the checkpoint being aligned so its watermark min stays sound.
@@ -183,6 +179,48 @@ public class CoordinatorCommittingRowDataStoreWriteOperator
         // The downstream is a DiscardingSink, but emitting keeps numRecordsOut observable and
         // preserves the operator's IO metrics.
         committables.forEach(committable -> output.collect(new StreamRecord<>(committable)));
+    }
+
+    @Override
+    public OperatorSnapshotFutures snapshotState(
+            long checkpointId,
+            long timestamp,
+            CheckpointOptions checkpointOptions,
+            CheckpointStreamFactory storageLocation)
+            throws Exception {
+        // emitCommittables already ran in prepareSnapshotPreBarrier and buffered this checkpoint's
+        // entry. The savepoint intent only becomes observable here, so stamp it on the buffered
+        // entry before reporting so both the event and the persisted state carry it.
+        if (checkpointOptions.getCheckpointType().isSavepoint()) {
+            pendingCommittables.computeIfPresent(
+                    checkpointId, (id, entry) -> entry.withSavepoint(true));
+        }
+        reportToCoordinator(checkpointId);
+        // super drives snapshotState(StateSnapshotContext) which persists the buffered pending map.
+        return super.snapshotState(checkpointId, timestamp, checkpointOptions, storageLocation);
+    }
+
+    @Override
+    public void endInput() throws Exception {
+        // endInput emits the Long.MAX_VALUE entry via emitCommittables but is not followed by a
+        // snapshotState, so report it here. End-of-input is never a savepoint.
+        super.endInput();
+        reportToCoordinator(Long.MAX_VALUE);
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        super.notifyCheckpointComplete(checkpointId);
+        // operator state already persisted these; we no longer need to replay them on the next
+        // restore
+        pendingCommittables.headMap(checkpointId, true).clear();
+    }
+
+    /** Sends the buffered entry for {@code checkpointId} to the coordinator, one per checkpoint. */
+    private void reportToCoordinator(long checkpointId) throws IOException {
+        operatorEventGateway.sendEventToCoordinator(
+                CommittableEvent.create(
+                        checkpointId, pendingCommittables.get(checkpointId), eventSerializer));
     }
 
     @Override
