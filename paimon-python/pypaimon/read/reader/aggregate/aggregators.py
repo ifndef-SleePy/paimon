@@ -22,25 +22,28 @@ Each class registers itself with the global registry at import time
 via :func:`register_aggregator`, so importing
 ``pypaimon.read.reader.aggregate`` makes all of them discoverable.
 
-This module ships 10 aggregators — the primary-key placeholder plus
-the 9 most commonly-used value aggregators: ``primary_key`` /
+This module ships 19 aggregators — the primary-key placeholder plus
+the 18 most commonly-used value aggregators: ``primary_key`` /
 ``last_value`` / ``last_non_null_value`` / ``first_value`` /
 ``first_non_null_value`` / ``sum`` / ``max`` / ``min`` / ``bool_or``
-/ ``bool_and``. Other aggregators (``product`` / ``listagg`` /
-``collect`` / ``merge_map`` / ``nested_update`` / ``theta_sketch`` /
-``hll_sketch`` / ``roaring_bitmap_*``) are intentionally deferred —
+/ ``bool_and`` / ``product`` / ``listagg`` / ``collect`` /
+``merge_map`` / ``merge_map_with_keytime`` / ``nested_update`` /
+``nested_partial_update`` / ``theta_sketch`` / ``rbm32``. Other
+aggregators (``hll_sketch`` / ``rbm64``) are intentionally deferred —
 the registry will report them as unsupported so users see a clear
 error rather than a silent fallback.
 """
-
-from typing import Any, List, Dict, Optional, Tuple, Union
+from typing import Any, List, Dict, Optional, Tuple, Union, Set
 
 from pypaimon.common.options import CoreOptions
 from pypaimon.common.options.core_options import NestedKeyNullStrategy
+from pypaimon.data.decimal import Decimal
 from pypaimon.read.reader.aggregate import register_aggregator
 from pypaimon.read.reader.aggregate.field_aggregator import FieldAggregator
 from pypaimon.schema.data_types import AtomicType, DataType, ArrayType, RowType, MapType
+from pypaimon.table.row.generic_row import GenericRow
 from pypaimon.table.row.internal_row import InternalRow
+from pypaimon.utils.roaring_bitmap import RoaringBitmap
 
 # aggregator input type hints variables
 Record = Union[InternalRow, Dict[str, Any]]
@@ -54,15 +57,30 @@ NAME_LAST_NON_NULL_VALUE = "last_non_null_value"
 NAME_FIRST_VALUE = "first_value"
 NAME_FIRST_NON_NULL_VALUE = "first_non_null_value"
 NAME_SUM = "sum"
+NAME_PRODUCT = "product"
 NAME_MAX = "max"
 NAME_MIN = "min"
 NAME_BOOL_OR = "bool_or"
 NAME_BOOL_AND = "bool_and"
 NAME_LISTAGG = "listagg"
 NAME_NESTED_UPDATE = "nested_update"
+NAME_NESTED_PARTIAL_UPDATE = "nested_partial_update"
 NAME_COLLECT = "collect"
 NAME_MERGE_MAP_WITH_KEYTIME = "merge_map_with_keytime"
+NAME_MERGE_MAP = "merge_map"
+NAME_THETA_SKETCH = "theta_sketch"
+NAME_RBM32 = "rbm32"
 
+
+# Integer range limits used for overflow checking.
+_BYTE_MIN = -128
+_BYTE_MAX = 127
+_SHORT_MIN = -32768
+_SHORT_MAX = 32767
+_INT_MIN = -(1 << 31)
+_INT_MAX = (1 << 31) - 1
+_LONG_MIN = -(1 << 63)
+_LONG_MAX = (1 << 63) - 1
 
 # Base SQL type names treated as numeric for sum/product-style
 # aggregators. NUMERIC / DEC are SQL synonyms accepted by the parser;
@@ -71,6 +89,16 @@ _NUMERIC_BASE_TYPES = frozenset([
     "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT",
     "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "DEC",
 ])
+
+# SQL type names treated as decimal. NUMERIC / DEC are SQL
+# synonyms accepted by the parser; treat them the same as DECIMAL.
+_DECIMAL_TYPES = frozenset({"DECIMAL", "NUMERIC", "DEC"})
+
+# SQL type names treated as integer.
+_INT_TYPES = frozenset({"INT", "INTEGER"})
+
+# SQL type names treated as floating-point.
+_FLOAT_TYPES = frozenset({"FLOAT", "DOUBLE"})
 
 
 def _atomic_base_name(field_type: DataType):
@@ -119,6 +147,18 @@ def _check_array_row(name: str, field_type: DataType) -> ArrayType:
             .format(name, field_type)
         )
 
+    return field_type
+
+
+def _check_roaring_bitmap(name: str, field_type: DataType):
+    """Check field_type is VarBinaryType and return the VarBinaryType."""
+
+    base = _atomic_base_name(field_type)
+    if base not in ("VARBINARY", "BYTES"):
+        raise ValueError(
+            "Data type for {} column must be 'VARBINARY' or 'BYTES' but was "
+            "'{}'.".format(name, field_type)
+        )
     return field_type
 
 
@@ -340,17 +380,301 @@ class FieldFirstNonNullValueAgg(FieldAggregator):
 
 
 class FieldSumAgg(FieldAggregator):
-    """Numeric sum. ``None`` on either side returns the non-null
-    operand. Python's native ``+`` works uniformly for int / float /
-    Decimal — the values produced by the pyarrow read path already
-    arrive as the right Python primitive for the column's SQL type, so
-    no per-type branching is needed.
     """
+    Numeric sum aggregator.
+
+    Returns the non-null operand if either side is ``None``. Performs
+    overflow checking for integral types and preserves decimal
+    precision and scale for DECIMAL values.
+    """
+    def __init__(self, name: str, field_type: DataType):
+        super().__init__(name, field_type)
+        self._base_type = _atomic_base_name(field_type)
+        if self._base_type in _DECIMAL_TYPES:
+            self._precision, self._scale = Decimal.extract_decimal_precision_scale(field_type.type)
+        else:
+            self._precision = None
+            self._scale = None
 
     def agg(self, accumulator: Any, input_field: Any) -> Any:
         if accumulator is None or input_field is None:
             return accumulator if input_field is None else input_field
-        return accumulator + input_field
+
+        if self._base_type in _DECIMAL_TYPES:
+            result = Decimal.add(accumulator, input_field, self._precision)
+
+            value = Decimal.from_big_decimal(
+                result,
+                self._precision,
+                self._scale
+            )
+            return None if value is None else value.to_big_decimal()
+
+        elif self._base_type == "TINYINT":
+            value = accumulator + input_field
+            if value < _BYTE_MIN or value > _BYTE_MAX:
+                raise ArithmeticError(
+                    "byte overflow: {} + {} = {}".format(accumulator, input_field, value)
+                )
+            return value
+
+        elif self._base_type == "SMALLINT":
+            value = accumulator + input_field
+            if value < _SHORT_MIN or value > _SHORT_MAX:
+                raise ArithmeticError(
+                    "short overflow: {} + {} = {}".format(accumulator, input_field, value)
+                )
+            return value
+
+        elif self._base_type in _INT_TYPES:
+            value = accumulator + input_field
+            if value < _INT_MIN or value > _INT_MAX:
+                raise ArithmeticError(
+                    "int overflow: {} + {}".format(accumulator, input_field)
+                )
+            return value
+
+        elif self._base_type == "BIGINT":
+            value = accumulator + input_field
+            if value < _LONG_MIN or value > _LONG_MAX:
+                raise ArithmeticError(
+                    "long overflow: {} + {}".format(accumulator, input_field)
+                )
+            return value
+
+        elif self._base_type in _FLOAT_TYPES:
+            return accumulator + input_field
+
+        raise ValueError(
+            "type {} not support in {}".format(self._base_type, self.__class__.__name__)
+        )
+
+    def retract(self, accumulator: Any, retract_field: Any) -> Any:
+        if accumulator is None or retract_field is None:
+            return self._negative(retract_field) if accumulator is None else accumulator
+
+        if self._base_type in _DECIMAL_TYPES:
+            result = Decimal.subtract(accumulator, retract_field, self._precision)
+
+            value = Decimal.from_big_decimal(
+                result,
+                self._precision,
+                self._scale,
+            )
+            return None if value is None else value.to_big_decimal()
+
+        elif self._base_type == "TINYINT":
+            value = accumulator - retract_field
+            if value < _BYTE_MIN or value > _BYTE_MAX:
+                raise ArithmeticError(
+                    "byte overflow: {} - {} = {}".format(accumulator, retract_field, value)
+                )
+            return value
+
+        elif self._base_type == "SMALLINT":
+            value = accumulator - retract_field
+            if value < _SHORT_MIN or value > _SHORT_MAX:
+                raise ArithmeticError(
+                    "short overflow: {} - {} = {}".format(accumulator, retract_field, value)
+                )
+            return value
+
+        elif self._base_type in _INT_TYPES:
+            value = accumulator - retract_field
+            if value < _INT_MIN or value > _INT_MAX:
+                raise ArithmeticError(
+                    "int overflow: {} - {}".format(accumulator, retract_field)
+                )
+            return value
+
+        elif self._base_type == "BIGINT":
+            value = accumulator - retract_field
+            if value < _LONG_MIN or value > _LONG_MAX:
+                raise ArithmeticError(
+                    "long overflow: {} - {}".format(accumulator,  retract_field)
+                )
+            return value
+
+        elif self._base_type in _FLOAT_TYPES:
+            return accumulator - retract_field
+
+        raise ValueError(
+            "type {} not support in {}".format(self._base_type, self.__class__.__name__)
+        )
+
+    def _negative(self, value: Any) -> Any:
+        if value is None:
+            return None
+
+        if self._base_type in _DECIMAL_TYPES:
+            return -value
+
+        elif self._base_type == "TINYINT":
+            result = -value
+            if result < _BYTE_MIN or result > _BYTE_MAX:
+                raise ArithmeticError("byte overflow: -{} = {}".format(value, result))
+            return result
+
+        elif self._base_type == "SMALLINT":
+            result = -value
+            if result < _SHORT_MIN or result > _SHORT_MAX:
+                raise ArithmeticError("short overflow: -{} = {}".format(value, result))
+            return result
+
+        elif self._base_type in _INT_TYPES:
+            result = -value
+            if result < _INT_MIN or result > _INT_MAX:
+                raise ArithmeticError("int overflow: -{}".format(value))
+            return result
+
+        elif self._base_type == "BIGINT":
+            result = -value
+            if result < _LONG_MIN or result > _LONG_MAX:
+                raise ArithmeticError("long overflow: -{}".format(value))
+            return result
+
+        elif self._base_type in _FLOAT_TYPES:
+            return -value
+
+        raise ValueError(
+            "type {} not support in {}".format(self._base_type, self.__class__.__name__)
+        )
+
+
+class FieldProductAgg(FieldAggregator):
+    """
+    Numeric product aggregator.
+
+    Null values are ignored and the non-null operand is returned.
+    Otherwise, returns the product of accumulator and input value.
+    """
+    def __init__(self, name: str, field_type: DataType):
+        super().__init__(name, field_type)
+        self._base_type = _atomic_base_name(field_type)
+        if self._base_type in _DECIMAL_TYPES:
+            self._precision, self._scale = Decimal.extract_decimal_precision_scale(field_type.type)
+        else:
+            self._precision = None
+            self._scale = None
+
+    def agg(self, accumulator: Any, input_field: Any) -> Any:
+        if accumulator is None or input_field is None:
+            return accumulator if input_field is None else input_field
+
+        if self._base_type in _DECIMAL_TYPES:
+            mul = Decimal.multiply(accumulator, input_field, self._precision)
+
+            value = Decimal.from_big_decimal(
+                mul,
+                self._precision,
+                self._scale,
+            )
+            return None if value is None else value.to_big_decimal()
+
+        elif self._base_type == "TINYINT":
+            value = accumulator * input_field
+            if value < _BYTE_MIN or value > _BYTE_MAX:
+                raise ArithmeticError(
+                    "byte overflow: {} * {} = {}".format(accumulator, input_field, value)
+                )
+            return value
+
+        elif self._base_type == "SMALLINT":
+            value = accumulator * input_field
+            if value < _SHORT_MIN or value > _SHORT_MAX:
+                raise ArithmeticError(
+                    "short overflow: {} * {} = {}".format(accumulator, input_field, value)
+                )
+            return value
+
+        elif self._base_type in _INT_TYPES:
+            value = accumulator * input_field
+            if value < _INT_MIN or value > _INT_MAX:
+                raise ArithmeticError(
+                    "int overflow: {} * {}".format(accumulator, input_field)
+                )
+            return value
+
+        elif self._base_type == "BIGINT":
+            value = accumulator * input_field
+            if value < _LONG_MIN or value > _LONG_MAX:
+                raise ArithmeticError(
+                    "long overflow: {} * {}".format(accumulator, input_field)
+                )
+            return value
+
+        elif self._base_type in _FLOAT_TYPES:
+            return accumulator * input_field
+
+        raise ValueError(
+            "type {} not support in {}".format(self._base_type, self.__class__.__name__)
+        )
+
+    def retract(self, accumulator: Any, retract_field: Any) -> Any:
+        if accumulator is None or retract_field is None:
+            return accumulator
+
+        if self._base_type in _DECIMAL_TYPES:
+            div = Decimal.divide(accumulator, retract_field, self._precision)
+
+            value = Decimal.from_big_decimal(
+                div,
+                self._precision,
+                self._scale,
+            )
+            return None if value is None else value.to_big_decimal()
+
+        elif self._base_type == "TINYINT":
+            value = int(accumulator / retract_field)
+            if value > _BYTE_MAX or value < _BYTE_MIN:
+                raise ArithmeticError(
+                    "byte overflow: {} / {} = {}".format(accumulator, retract_field, value)
+                )
+            return value
+
+        elif self._base_type == "SMALLINT":
+            value = int(accumulator / retract_field)
+            if value > _SHORT_MAX or value < _SHORT_MIN:
+                raise ArithmeticError(
+                    "short overflow: {} / {} = {}".format(accumulator, retract_field, value)
+                )
+            return value
+
+        elif self._base_type in _INT_TYPES:
+            if accumulator == _INT_MIN and retract_field == -1:
+                raise ArithmeticError(
+                    "int overflow: {} / {}".format(accumulator, retract_field)
+                )
+            return int(accumulator / retract_field)
+
+        elif self._base_type == "BIGINT":
+            if accumulator == _LONG_MIN and retract_field == -1:
+                raise ArithmeticError(
+                    "long overflow: {} / {}".format(accumulator, retract_field)
+                )
+
+            # Java integer division truncates toward zero, while Python's "//"
+            # floors toward negative infinity. Divide absolute values first, then
+            # restore the sign to match Java semantics without converting through
+            # float (which would lose precision for BIGINT values).
+            if (accumulator >= 0) == (retract_field >= 0):
+                return abs(accumulator) // abs(retract_field)
+            else:
+                return -(abs(accumulator) // abs(retract_field))
+
+        elif self._base_type in _FLOAT_TYPES:
+            if retract_field == 0.0:
+                if accumulator == 0.0:
+                    return float("nan")
+                elif accumulator > 0:
+                    return float("inf")
+                else:
+                    return float("-inf")
+            return accumulator / retract_field
+
+        raise ValueError(
+            "type {} not support in {}".format(self._base_type, self.__class__.__name__)
+        )
 
 
 class FieldMaxAgg(FieldAggregator):
@@ -731,6 +1055,125 @@ class FieldNestedUpdateAgg(FieldAggregator):
         )
 
 
+class FieldNestedPartialUpdateAgg(FieldAggregator):
+    """
+    Used to partial update a field which representing a nested table.
+    The data type of nested table field is ARRAY<ROW>
+    """
+    def __init__(
+            self,
+            name: str,
+            field_type: ArrayType,
+            field_name: str,
+            options: CoreOptions,
+    ):
+        field_type = _check_array_row(field_name, field_type)
+        super().__init__(name, field_type)
+
+        nested_type: RowType = field_type.element
+        self.nested_fields = len(nested_type.fields)
+
+        self.nested_key = options.field_nested_update_agg_nested_key(field_name)
+        if not self.nested_key:
+            raise ValueError("nested_update_partial requires 'nested-key' to be configured.")
+
+        self.key_projection = FieldProjection.from_fields(
+            [nested_type.get_field_index(name) for name in self.nested_key],
+            self.nested_key
+        )
+
+        self.nested_key_null_strategy = (
+            options.field_nested_update_agg_nested_key_null_strategy(field_name)
+        )
+
+    def agg(self, accumulator: Any, input_field: Any) -> Any:
+        if input_field is None:
+            return accumulator
+
+        rows: List[Record] = []
+        if accumulator is not None:
+            self._add_non_null_rows(accumulator, rows)
+        self._add_non_null_rows(input_field, rows)
+
+        row_map: Dict[Tuple[Any, ...], Record] = {}
+        for row in rows:
+            key = self.key_projection.apply(row)
+            if not self._apply_nested_key_null_strategy(key):
+                continue
+
+            to_update = row_map.get(key)
+            if to_update is None:
+                if isinstance(row, InternalRow):
+                    to_update = GenericRow([None] * self.nested_fields, row.fields)
+                elif isinstance(row, dict):
+                    to_update = {}.fromkeys(row.keys())
+                else:
+                    raise TypeError(
+                        "Unsupported row type '{}'. Expected InternalRow or dict.".format(
+                            type(row).__name__
+                        )
+                    )
+            self._partial_update(to_update, row)
+            row_map[key] = to_update
+
+        return list(row_map.values())
+
+    def _partial_update(self, to_update: Record, input_row: Record) -> None:
+        if isinstance(to_update, InternalRow) and isinstance(input_row, InternalRow):
+            for i in range(self.nested_fields):
+                value = input_row.get_field(i)
+                if value is not None:
+                    to_update.values[i] = value
+        elif isinstance(to_update, dict) and isinstance(input_row, dict):
+            for k, v in input_row.items():
+                if v is not None:
+                    to_update[k] = v
+        else:
+            raise TypeError(
+                "Unsupported row types: to_update={}, input_row={}. "
+                "Expected both to be either InternalRow or dict.".format(
+                    type(to_update).__name__,
+                    type(input_row).__name__,
+                )
+            )
+
+    def _add_non_null_rows(
+            self,
+            array: List[Record],
+            rows: List[Record],
+    ) -> None:
+        """Append non-null rows from array."""
+
+        for row in array:
+            if row is None:
+                continue
+            rows.append(row)
+
+    def _apply_nested_key_null_strategy(self, key: Tuple[Any, ...]) -> bool:
+        """Apply nested-key-null-strategy."""
+
+        if all(v is not None for v in key):
+            return True
+
+        if self.nested_key_null_strategy == NestedKeyNullStrategy.MERGE:
+            return True
+
+        if self.nested_key_null_strategy == NestedKeyNullStrategy.IGNORE:
+            return False
+
+        if self.nested_key_null_strategy == NestedKeyNullStrategy.ERROR:
+            raise ValueError(
+                "Nested key contains null values. "
+                "Primary key fields must not be null."
+            )
+
+        raise ValueError(
+            "Unsupported nested-key-null-strategy '{}'".format(
+                self.nested_key_null_strategy
+            )
+        )
+
+
 class FieldMergeMapWithKeyTimeAgg(FieldAggregator):
     """
     Aggregator for merging MAP values with key and timestamp.
@@ -851,6 +1294,159 @@ class FieldMergeMapWithKeyTimeAgg(FieldAggregator):
         )
 
 
+class FieldMergeMapAgg(FieldAggregator):
+    """
+    Merge map values by combining all key-value pairs.
+
+    When the same key exists in both maps, the value from the input map
+    overwrites the value from the accumulator map.
+    """
+
+    def __init__(self, name: str, field_type: DataType):
+        super().__init__(name, field_type)
+        if not isinstance(field_type, MapType):
+            raise ValueError(
+                "Data type for merge map column must be 'MAP' but was '{}'".format(field_type)
+            )
+
+    def agg(self, accumulator: Any, input_field: Any) -> Any:
+        if accumulator is None or input_field is None:
+            return input_field if accumulator is None else accumulator
+
+        result = {}
+
+        self._put_to_map(result, accumulator)
+        self._put_to_map(result, input_field)
+
+        return result
+
+    def retract(self, accumulator: Any, retract_field: Any) -> Any:
+        # it's hard to mark the input is retracted without accumulator
+        if accumulator is None:
+            return None
+
+        # nothing to be retracted
+        if retract_field is None:
+            return accumulator
+
+        if len(retract_field) == 0:
+            return accumulator
+
+        retract_keys = self._get_keys(retract_field)
+        acc = {}
+        self._put_to_map(acc, accumulator)
+
+        result = {
+            key: value
+            for key, value in acc.items()
+            if key not in retract_keys
+        }
+
+        return result
+
+    def _put_to_map(self, maps: Dict[Any, Any], input_field: Any):
+        if isinstance(input_field, dict):
+            maps.update(input_field)
+        elif isinstance(input_field, list):
+            tmp_map = {}
+            for item in input_field:
+                if not isinstance(item, dict):
+                    raise TypeError(
+                        "list element must be dict, got {}".format(type(item))
+                    )
+                tmp_map[item['key']] = item['value']
+
+            maps.update(tmp_map)
+        else:
+            raise TypeError(
+                "input_field must be dict or list[dict], got {}".format(type(input_field))
+            )
+
+    def _get_keys(self, retract_field: Any) -> Set[Any]:
+        keys = set()
+
+        if isinstance(retract_field, dict):
+            keys.update(retract_field.keys())
+
+        elif isinstance(retract_field, list):
+            for item in retract_field:
+                if not isinstance(item, dict):
+                    raise TypeError(
+                        "list element must be dict, got {}".format(type(item))
+                    )
+
+                keys.add(item["key"])
+        else:
+            raise TypeError(
+                "retract_field must be dict or list[dict], got {}".format(type(retract_field))
+            )
+
+        return keys
+
+
+class FieldThetaSketchAgg(FieldAggregator):
+    """Aggregator for ThetaSketch."""
+
+    def __init__(self, name: str, field_type: DataType):
+        super().__init__(name, field_type)
+        if _atomic_base_name(field_type) not in ("VARBINARY", "BYTES"):
+            raise ValueError(
+                "Data type for theta sketch column must be 'VarBinaryType' but was '{}'.".format(field_type)
+            )
+
+    def agg(self, accumulator: Any, input_field: Any) -> Any:
+        if accumulator is None or input_field is None:
+            return input_field if accumulator is None else accumulator
+
+        if not isinstance(accumulator, (bytes, bytearray)):
+            raise TypeError(
+                "ThetaSketch accumulator must be bytes, got {}".format(type(accumulator))
+            )
+
+        if not isinstance(input_field, (bytes, bytearray)):
+            raise TypeError(
+                "ThetaSketch input must be bytes, got {}".format(type(input_field))
+            )
+
+        if isinstance(accumulator, bytearray):
+            accumulator = bytes(accumulator)
+        if isinstance(input_field, bytearray):
+            input_field = bytes(input_field)
+
+        try:
+            from _datasketches import compact_theta_sketch, theta_union
+        except ImportError as exc:
+            raise ImportError(
+                "The theta_sketch aggregator requires the 'datasketches' "
+                "package. Install it with "
+                "\"pip install 'pypaimon[theta-sketch]'\"."
+            ) from exc
+
+        sketch1 = compact_theta_sketch.deserialize(accumulator)
+        sketch2 = compact_theta_sketch.deserialize(input_field)
+
+        union = theta_union()
+        union.update(sketch1)
+        union.update(sketch2)
+
+        return union.get_result().serialize()
+
+
+class FieldRoaringBitmap32Agg(FieldAggregator):
+    """roaring bitmap 32 aggregate a field of a row."""
+
+    def agg(self, accumulator: Any, input_field: Any) -> Any:
+        if accumulator is None or input_field is None:
+            return input_field if accumulator is None else accumulator
+
+        try:
+            acc = RoaringBitmap.deserialize(accumulator)
+            input_bitmap = RoaringBitmap.deserialize(input_field)
+            return RoaringBitmap.or_(acc, input_bitmap).serialize()
+        except Exception as ex:
+            raise RuntimeError("Unable to se/deserialize roaring bitmap.") from ex
+
+
 # ---------------------------------------------------------------------------
 # Registration. Each builder binds an identifier to a factory that
 # optionally validates the column DataType before constructing the
@@ -892,6 +1488,13 @@ def _build_field_options(cls, identifier: str):
     return _factory
 
 
+def _build_roaring_bitmap(cls, identifier: str):
+    def _factory(field_type, field_name, options):
+        _check_roaring_bitmap(identifier, field_type)
+        return cls(identifier, field_type)
+    return _factory
+
+
 register_aggregator(
     NAME_PRIMARY_KEY,
     _build_no_type_check(FieldPrimaryKeyAgg, NAME_PRIMARY_KEY),
@@ -913,6 +1516,7 @@ register_aggregator(
     _build_no_type_check(FieldFirstNonNullValueAgg, NAME_FIRST_NON_NULL_VALUE),
 )
 register_aggregator(NAME_SUM, _build_numeric(FieldSumAgg, NAME_SUM))
+register_aggregator(NAME_PRODUCT, _build_numeric(FieldProductAgg, NAME_PRODUCT))
 register_aggregator(NAME_MAX, _build_no_type_check(FieldMaxAgg, NAME_MAX))
 register_aggregator(NAME_MIN, _build_no_type_check(FieldMinAgg, NAME_MIN))
 register_aggregator(
@@ -928,8 +1532,20 @@ register_aggregator(
     NAME_NESTED_UPDATE, _build_field_options(FieldNestedUpdateAgg, NAME_NESTED_UPDATE)
 )
 register_aggregator(
+    NAME_NESTED_PARTIAL_UPDATE, _build_field_options(FieldNestedPartialUpdateAgg, NAME_NESTED_PARTIAL_UPDATE)
+)
+register_aggregator(
     NAME_COLLECT, _build_field_options(FieldCollectAgg, NAME_COLLECT)
 )
 register_aggregator(
     NAME_MERGE_MAP_WITH_KEYTIME, _build_field_options(FieldMergeMapWithKeyTimeAgg, NAME_MERGE_MAP_WITH_KEYTIME)
+)
+register_aggregator(
+    NAME_MERGE_MAP, _build_no_type_check(FieldMergeMapAgg, NAME_MERGE_MAP)
+)
+register_aggregator(
+    NAME_THETA_SKETCH, _build_no_type_check(FieldThetaSketchAgg, NAME_THETA_SKETCH)
+)
+register_aggregator(
+    NAME_RBM32, _build_roaring_bitmap(FieldRoaringBitmap32Agg, NAME_RBM32)
 )

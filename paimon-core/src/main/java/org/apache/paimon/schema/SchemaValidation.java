@@ -34,6 +34,7 @@ import org.apache.paimon.globalindex.bitmap.BitmapGlobalIndexerFactory;
 import org.apache.paimon.globalindex.btree.BTreeGlobalIndexerFactory;
 import org.apache.paimon.mergetree.compact.aggregate.FieldAggregator;
 import org.apache.paimon.mergetree.compact.aggregate.factory.FieldAggregatorFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastValueAggFactory;
 import org.apache.paimon.options.ConfigOption;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.BucketMode;
@@ -75,21 +76,29 @@ import static org.apache.paimon.CoreOptions.FIELDS_PREFIX;
 import static org.apache.paimon.CoreOptions.FIELDS_SEPARATOR;
 import static org.apache.paimon.CoreOptions.FULL_COMPACTION_DELTA_COMMITS;
 import static org.apache.paimon.CoreOptions.INCREMENTAL_BETWEEN;
+import static org.apache.paimon.CoreOptions.INCREMENTAL_BETWEEN_SCAN_MODE;
+import static org.apache.paimon.CoreOptions.INCREMENTAL_BETWEEN_TAG_TO_SNAPSHOT;
 import static org.apache.paimon.CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP;
 import static org.apache.paimon.CoreOptions.INCREMENTAL_TO_AUTO_TAG;
 import static org.apache.paimon.CoreOptions.MAP_STORAGE_LAYOUT;
 import static org.apache.paimon.CoreOptions.PRIMARY_KEY;
+import static org.apache.paimon.CoreOptions.SCAN_CREATION_TIME_MILLIS;
 import static org.apache.paimon.CoreOptions.SCAN_FILE_CREATION_TIME_MILLIS;
 import static org.apache.paimon.CoreOptions.SCAN_MODE;
 import static org.apache.paimon.CoreOptions.SCAN_SNAPSHOT_ID;
 import static org.apache.paimon.CoreOptions.SCAN_TAG_NAME;
 import static org.apache.paimon.CoreOptions.SCAN_TIMESTAMP;
 import static org.apache.paimon.CoreOptions.SCAN_TIMESTAMP_MILLIS;
+import static org.apache.paimon.CoreOptions.SCAN_VERSION;
 import static org.apache.paimon.CoreOptions.SCAN_WATERMARK;
 import static org.apache.paimon.CoreOptions.SNAPSHOT_NUM_RETAINED_MAX;
 import static org.apache.paimon.CoreOptions.SNAPSHOT_NUM_RETAINED_MIN;
 import static org.apache.paimon.CoreOptions.STREAMING_READ_OVERWRITE;
 import static org.apache.paimon.format.FileFormat.vectorFileFormat;
+import static org.apache.paimon.mergetree.compact.PartialUpdateMergeFunction.isSequenceGroupOption;
+import static org.apache.paimon.mergetree.compact.PartialUpdateMergeFunction.isSequenceGroupOptionCandidate;
+import static org.apache.paimon.mergetree.compact.PartialUpdateMergeFunction.sequenceGroupOrderingFields;
+import static org.apache.paimon.mergetree.compact.PartialUpdateMergeFunction.sequenceGroupProtectedFields;
 import static org.apache.paimon.schema.TableSchema.PAIMON_07_VERSION;
 import static org.apache.paimon.table.PrimaryKeyTableUtils.createMergeFunctionFactory;
 import static org.apache.paimon.table.SpecialFields.KEY_FIELD_PREFIX;
@@ -115,7 +124,8 @@ public class SchemaValidation {
                     ArrayType.class,
                     RowType.class,
                     MultisetType.class,
-                    VectorType.class);
+                    VectorType.class,
+                    VariantType.class);
 
     /**
      * Validate the {@link TableSchema} and {@link CoreOptions}.
@@ -139,13 +149,11 @@ public class SchemaValidation {
 
         validateOnlyContainPrimitiveType(schema.fields(), schema.primaryKeys(), "primary key");
         validateOnlyContainPrimitiveType(schema.fields(), schema.partitionKeys(), "partition");
-        validateOnlyContainPrimitiveType(schema.fields(), options.upsertKey(), "upsert key");
-
-        if (!options.upsertKey().isEmpty() && !schema.primaryKeys().isEmpty()) {
-            throw new RuntimeException(
+        if (options.primaryKeyNullable() && schema.primaryKeys().isEmpty()) {
+            throw new IllegalArgumentException(
                     String.format(
-                            "Cannot define 'upsert-key' %s with 'primary-key' %s.",
-                            options.upsertKey(), schema.primaryKeys()));
+                            "Option '%s' can only be enabled for a table with primary keys.",
+                            CoreOptions.PRIMARY_KEY_NULLABLE.key()));
         }
 
         validateBucket(schema, options);
@@ -155,6 +163,8 @@ public class SchemaValidation {
         validateFieldsPrefix(schema, options);
 
         validateSequenceField(schema, options);
+
+        validateSequenceGroupOrderingFields(schema, options);
 
         validateMergeFunction(schema);
 
@@ -192,6 +202,10 @@ public class SchemaValidation {
         }
 
         checkArgument(
+                options.targetFileRowNum() > 0,
+                CoreOptions.TARGET_FILE_ROW_NUM.key() + " should be at least 1");
+
+        checkArgument(
                 options.snapshotNumRetainMin() > 0,
                 SNAPSHOT_NUM_RETAINED_MIN.key() + " should be at least 1");
         checkArgument(
@@ -216,6 +230,7 @@ public class SchemaValidation {
         Set<String> blobDescriptorFields = validateBlobDescriptorFields(tableRowType, options);
         Set<String> blobViewFields =
                 validateBlobViewFields(tableRowType, options, blobDescriptorFields);
+        validatePrimaryKeyBlobKeyConfiguration(schema, options);
         validatePrimaryKeyBlobConfiguration(schema, options);
         Set<String> blobInlineFields = new HashSet<>(blobDescriptorFields);
         blobInlineFields.addAll(blobViewFields);
@@ -327,10 +342,6 @@ public class SchemaValidation {
 
         if (options.deletionVectorsEnabled()) {
             validateForDeletionVectors(options);
-        } else {
-            checkArgument(
-                    !options.deletionVectorsMergeOnRead(),
-                    "deletion-vectors.merge-on-read requires deletion-vectors.enabled to be true.");
         }
 
         if (options.snapshotSequenceOrdering()) {
@@ -363,6 +374,7 @@ public class SchemaValidation {
         validateMergeFunctionFactory(schema);
 
         validateMapStorageLayout(schema, options);
+        validateVariantShreddingInferenceOptions(options);
 
         validateFileIndex(schema);
 
@@ -515,6 +527,24 @@ public class SchemaValidation {
                             INCREMENTAL_BETWEEN,
                             INCREMENTAL_TO_AUTO_TAG),
                     Collections.singletonList(SCAN_FILE_CREATION_TIME_MILLIS));
+        } else if (options.startupMode() == CoreOptions.StartupMode.LATEST_DELTA) {
+            for (ConfigOption<?> option :
+                    Arrays.asList(
+                            SCAN_TIMESTAMP_MILLIS,
+                            SCAN_FILE_CREATION_TIME_MILLIS,
+                            SCAN_CREATION_TIME_MILLIS,
+                            SCAN_TIMESTAMP,
+                            SCAN_SNAPSHOT_ID,
+                            SCAN_TAG_NAME,
+                            SCAN_WATERMARK,
+                            SCAN_VERSION,
+                            INCREMENTAL_BETWEEN_TIMESTAMP,
+                            INCREMENTAL_BETWEEN,
+                            INCREMENTAL_TO_AUTO_TAG,
+                            INCREMENTAL_BETWEEN_SCAN_MODE,
+                            INCREMENTAL_BETWEEN_TAG_TO_SNAPSHOT)) {
+                checkOptionNotExistInMode(options, option, options.startupMode());
+            }
         } else {
             checkOptionNotExistInMode(options, SCAN_TIMESTAMP_MILLIS, options.startupMode());
             checkOptionNotExistInMode(
@@ -689,6 +719,44 @@ public class SchemaValidation {
                         "MAP shared-shredding currently does not support postpone bucket mode.");
             }
         }
+    }
+
+    private static void validateVariantShreddingInferenceOptions(CoreOptions options) {
+        int coldSampleRows =
+                options.toConfiguration().get(CoreOptions.VARIANT_SHREDDING_MAX_INFER_BUFFER_ROW);
+        checkArgument(
+                coldSampleRows > 0,
+                "%s must be positive.",
+                CoreOptions.VARIANT_SHREDDING_MAX_INFER_BUFFER_ROW.key());
+
+        double admissionRatio =
+                options.toConfiguration()
+                        .get(CoreOptions.VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO);
+        checkArgument(
+                admissionRatio >= 0 && admissionRatio <= 1,
+                "%s must be between 0 and 1.",
+                CoreOptions.VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO.key());
+
+        if (options.toConfiguration().get(CoreOptions.VARIANT_SHREDDING_INFERENCE_MODE)
+                != CoreOptions.VariantShreddingInferenceMode.ADAPTIVE) {
+            return;
+        }
+
+        int warmSampleRows =
+                options.toConfiguration()
+                        .get(CoreOptions.VARIANT_SHREDDING_ADAPTIVE_MAX_INFER_BUFFER_ROW);
+        checkArgument(
+                warmSampleRows > 0,
+                "%s must be positive.",
+                CoreOptions.VARIANT_SHREDDING_ADAPTIVE_MAX_INFER_BUFFER_ROW.key());
+        double retentionRatio =
+                options.toConfiguration()
+                        .get(CoreOptions.VARIANT_SHREDDING_ADAPTIVE_RETENTION_RATIO);
+        checkArgument(
+                retentionRatio >= 0 && retentionRatio <= admissionRatio,
+                "%s must be between 0 and %s.",
+                CoreOptions.VARIANT_SHREDDING_ADAPTIVE_RETENTION_RATIO.key(),
+                CoreOptions.VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO.key());
     }
 
     private static void validateUnsupportedTypesWithMapSharedShredding(
@@ -933,7 +1001,7 @@ public class SchemaValidation {
                 options.mergeEngine() == MergeEngine.FIRST_ROW || options.deletionVectorsEnabled(),
                 "Primary-key vector index requires deletion-vectors.enabled = true.");
         checkArgument(
-                !options.deletionVectorsMergeOnRead(),
+                !options.deletionVectorsEnabled() || !options.deletionVectorsMergeOnRead(),
                 "Primary-key vector index with merge-engine = %s requires deletion-vectors.merge-on-read = false.",
                 options.mergeEngine());
         checkArgument(
@@ -991,7 +1059,7 @@ public class SchemaValidation {
                 options.mergeEngine() == MergeEngine.FIRST_ROW || options.deletionVectorsEnabled(),
                 "Primary-key full-text index requires deletion-vectors.enabled = true.");
         checkArgument(
-                !options.deletionVectorsMergeOnRead(),
+                !options.deletionVectorsEnabled() || !options.deletionVectorsMergeOnRead(),
                 "Primary-key full-text index requires deletion-vectors.merge-on-read = false.");
         checkArgument(
                 options.bucket() > 0 || options.bucket() == BucketMode.POSTPONE_BUCKET,
@@ -1158,7 +1226,7 @@ public class SchemaValidation {
         int bucket = options.bucket();
         if (bucket == -1) {
             if (options.toMap().get(BUCKET_KEY.key()) != null) {
-                throw new RuntimeException(
+                throw new IllegalArgumentException(
                         "Cannot define 'bucket-key' with bucket = -1, please remove the 'bucket-key' setting or specify a bucket number.");
             }
 
@@ -1384,6 +1452,90 @@ public class SchemaValidation {
             return;
         }
 
+        checkArgument(
+                options.mergeEngine() == MergeEngine.DEDUPLICATE
+                        || options.mergeEngine() == MergeEngine.PARTIAL_UPDATE
+                        || options.mergeEngine() == MergeEngine.FIRST_ROW,
+                "Primary-key managed BLOB tables only support the deduplicate, "
+                        + "partial-update or first-row merge engine.");
+        checkArgument(
+                options.changelogProducer() == ChangelogProducer.NONE,
+                "Primary-key managed BLOB tables only support changelog-producer 'none'.");
+        checkArgument(
+                options.dataFileExternalPaths() == null,
+                "Primary-key managed BLOB tables do not support '%s'.",
+                CoreOptions.DATA_FILE_EXTERNAL_PATHS.key());
+        checkArgument(
+                !options.pkClusteringOverride(),
+                "Primary-key managed BLOB tables do not support '%s'.",
+                CoreOptions.PK_CLUSTERING_OVERRIDE.key());
+
+        if (options.mergeEngine() == MergeEngine.PARTIAL_UPDATE && !options.ignoreDelete()) {
+            Set<String> fieldsProtectedBySequenceGroup =
+                    options.toMap().entrySet().stream()
+                            .filter(entry -> isSequenceGroupOption(entry.getKey()))
+                            .flatMap(
+                                    entry ->
+                                            sequenceGroupProtectedFields(entry.getValue()).stream())
+                            .collect(Collectors.toSet());
+            for (String field : managedBlobFields) {
+                if (!fieldsProtectedBySequenceGroup.contains(field)) {
+                    continue;
+                }
+                String aggregateFunction = options.fieldAggFunc(field);
+                if (aggregateFunction == null) {
+                    aggregateFunction = options.fieldsDefaultFunc();
+                }
+                checkArgument(
+                        aggregateFunction == null
+                                || FieldLastValueAggFactory.NAME.equals(aggregateFunction)
+                                || options.fieldAggIgnoreRetract(field),
+                        "Managed BLOB field '%s' cannot use aggregate function '%s' because "
+                                + "managed BLOB payloads are not retained in retract messages. "
+                                + "Set 'fields.%s.ignore-retract' to true to ignore retract messages.",
+                        field,
+                        aggregateFunction,
+                        field);
+            }
+        }
+    }
+
+    private static void validateSequenceGroupOrderingFields(
+            TableSchema schema, CoreOptions options) {
+        if (options.mergeEngine() != MergeEngine.PARTIAL_UPDATE) {
+            return;
+        }
+
+        RowType rowType = new RowType(schema.fields());
+        for (String optionKey : options.toMap().keySet()) {
+            if (!isSequenceGroupOptionCandidate(optionKey)) {
+                continue;
+            }
+            for (String fieldName : sequenceGroupOrderingFields(optionKey)) {
+                DataField field = rowType.getField(fieldName);
+                checkArgument(
+                        !containsType(field.type(), type -> type.is(DataTypeRoot.BLOB)),
+                        "Field '%s' with type %s cannot be used as a sequence-group ordering "
+                                + "field in option '%s'.",
+                        fieldName,
+                        field.type(),
+                        optionKey);
+            }
+        }
+    }
+
+    private static void validatePrimaryKeyBlobKeyConfiguration(
+            TableSchema schema, CoreOptions options) {
+        if (schema.primaryKeys().isEmpty()) {
+            return;
+        }
+
+        Set<String> managedBlobFields =
+                fieldNamesInBlobFile(new RowType(schema.fields()), options.blobInlineField());
+        if (managedBlobFields.isEmpty()) {
+            return;
+        }
+
         List<String> primaryKeyBlobFields =
                 managedBlobFields.stream()
                         .filter(schema.primaryKeys()::contains)
@@ -1410,21 +1562,6 @@ public class SchemaValidation {
                 sequenceBlobFields.isEmpty(),
                 "Managed BLOB fields cannot be sequence fields: %s.",
                 sequenceBlobFields);
-
-        checkArgument(
-                options.mergeEngine() == MergeEngine.DEDUPLICATE,
-                "Primary-key managed BLOB tables only support the deduplicate merge engine.");
-        checkArgument(
-                options.changelogProducer() == ChangelogProducer.NONE,
-                "Primary-key managed BLOB tables only support changelog-producer 'none'.");
-        checkArgument(
-                options.dataFileExternalPaths() == null,
-                "Primary-key managed BLOB tables do not support '%s'.",
-                CoreOptions.DATA_FILE_EXTERNAL_PATHS.key());
-        checkArgument(
-                !options.pkClusteringOverride(),
-                "Primary-key managed BLOB tables do not support '%s'.",
-                CoreOptions.PK_CLUSTERING_OVERRIDE.key());
     }
 
     private static void validateIncrementalClustering(TableSchema schema, CoreOptions options) {
@@ -1474,8 +1611,10 @@ public class SchemaValidation {
                             || changelogProducer == ChangelogProducer.INPUT,
                     "Changelog producer must be none or input for chain table.");
             Preconditions.checkArgument(
-                    !options.deletionVectorsEnabled(),
-                    "Chain table do not support enable deletion vector");
+                    !options.deletionVectorsEnabled()
+                            || options.deletionVectorsEnabled()
+                                    && options.mergeEngine() == MergeEngine.DEDUPLICATE,
+                    "Chain tables only support deletion vectors with the deduplicate merge engine.");
             Preconditions.checkArgument(
                     options.partitionTimestampPattern() != null,
                     "Partition timestamp pattern is required for chain table.");

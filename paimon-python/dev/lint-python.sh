@@ -247,6 +247,9 @@ function pytest_torch_check() {
 }
 # Mixed tests check - runs Java-Python interoperability tests
 function mixed_check() {
+    # Native-plan coverage is asserted only by the main pytest session.
+    unset PYPAIMON_TEST_NATIVE_PLAN
+
     # Get Python version
     PYTHON_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     echo "Detected Python version: $PYTHON_VERSION"
@@ -359,5 +362,10 @@ done
 
 # collect checks according to the options
 collect_checks
+
+if python -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"; then
+    python -m pip install 'paimon-ftindex==0.1.0' || exit 1
+fi
+
 # run checks
 check_stage

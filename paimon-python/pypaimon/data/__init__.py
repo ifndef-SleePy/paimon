@@ -16,5 +16,12 @@
 # under the License.
 
 from pypaimon.data.timestamp import Timestamp
+from pypaimon.data.decimal import Decimal
+from pypaimon.data.variant_path import variant_get, variant_replace
 
-__all__ = ['Timestamp']
+__all__ = [
+    'Timestamp',
+    'Decimal',
+    'variant_get',
+    'variant_replace',
+]

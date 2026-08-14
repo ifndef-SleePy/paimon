@@ -18,12 +18,12 @@
 
 package org.apache.paimon.spark.extensions
 
-import org.apache.paimon.spark.catalyst.analysis.{PaimonAnalysis, PaimonDeleteTable, PaimonFunctionResolver, PaimonIncompatibleResolutionRules, PaimonMergeInto, PaimonPostHocResolutionRules, PaimonProcedureResolver, PaimonUpdateTable, PaimonViewResolver, ReplacePaimonFunctions, RewriteUpsertTable}
-import org.apache.paimon.spark.catalyst.optimizer.{MergePaimonScalarSubqueries, OptimizeMetadataOnlyDeleteFromPaimonTable, PushDownLateralVectorSearchFilter}
+import org.apache.paimon.spark.catalyst.analysis.{PaimonAnalysis, PaimonDeleteTable, PaimonFunctionResolver, PaimonIncompatibleResolutionRules, PaimonMergeInto, PaimonPostHocResolutionRules, PaimonProcedureResolver, PaimonUpdateTable, PaimonViewResolver, ReplacePaimonFunctions}
+import org.apache.paimon.spark.catalyst.optimizer.{MergePaimonScalarSubqueries, OptimizeMetadataOnlyDeleteFromPaimonTable, PushDownLateralVectorSearchFilter, RepartitionLateralVectorSearchInput}
 import org.apache.paimon.spark.catalyst.plans.logical.PaimonTableValuedFunctions
 import org.apache.paimon.spark.commands.BucketExpression
 import org.apache.paimon.spark.execution.{OldCompatibleStrategy, PaimonStrategy}
-import org.apache.paimon.spark.execution.adaptive.DisableUnnecessaryPaimonBucketedScan
+import org.apache.paimon.spark.execution.adaptive.{DisablePostponeCarrierShuffleCoalescing, DisableUnnecessaryPaimonBucketedScan}
 
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -44,8 +44,6 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectResolutionRule(spark => PaimonFunctionResolver(spark))
     extensions.injectResolutionRule(spark => SparkShimLoader.shim.createCustomResolution(spark))
     extensions.injectResolutionRule(spark => PaimonIncompatibleResolutionRules(spark))
-    extensions.injectResolutionRule(spark => RewriteUpsertTable(spark))
-
     extensions.injectPostHocResolutionRule(spark => ReplacePaimonFunctions(spark))
     extensions.injectPostHocResolutionRule(spark => PaimonPostHocResolutionRules(spark))
 
@@ -100,10 +98,9 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
     // optimization rules
     extensions.injectOptimizerRule(spark => ReplacePaimonFunctions(spark))
-    extensions.injectOptimizerRule(_ => OptimizeMetadataOnlyDeleteFromPaimonTable)
-    // TODO: Enable MAP selected-key pushdown after core reader supports
-    // __PAIMON_MAP_SELECTED_KEYS read type.
+    extensions.injectOptimizerRule(spark => OptimizeMetadataOnlyDeleteFromPaimonTable(spark))
     extensions.injectOptimizerRule(_ => MergePaimonScalarSubqueries)
+    extensions.injectOptimizerRule(_ => RepartitionLateralVectorSearchInput)
     extensions.injectOptimizerRule(_ => PushDownLateralVectorSearchFilter)
 
     // planner extensions
@@ -113,6 +110,7 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
     // query stage preparation
     extensions.injectQueryStagePrepRule(_ => DisableUnnecessaryPaimonBucketedScan)
+    extensions.injectQueryStagePrepRule(_ => DisablePostponeCarrierShuffleCoalescing)
   }
 
   /**

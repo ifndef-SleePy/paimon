@@ -175,7 +175,6 @@ const sidebars = {
       "spark/auxiliary",
       "spark/default-value",
       "spark/dataframe",
-      "spark/sql-upsert",
       "spark/structured-streaming",
       "spark/procedures"
     ]
@@ -252,7 +251,6 @@ const sidebars = {
       "maintenance/rescale-bucket",
       "maintenance/manage-tags",
       "maintenance/metrics",
-      "maintenance/manage-privileges",
       "maintenance/manage-branches",
       "maintenance/manage-partitions",
       "maintenance/configurations"
@@ -318,6 +316,8 @@ const sidebars = {
     },
     "items": [
       "project/download",
+      "project/creating-a-release",
+      "project/verifying-a-release-candidate",
       "project/contributing",
       "project/committer",
       "project/security"

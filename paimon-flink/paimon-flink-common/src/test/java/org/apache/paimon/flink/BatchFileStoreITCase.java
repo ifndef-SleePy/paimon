@@ -1166,6 +1166,19 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
     }
 
     @Test
+    public void testLatestDeltaScanMode() {
+        sql("CREATE TABLE latest_delta (id INT, v STRING)");
+        sql("INSERT INTO latest_delta VALUES (1, 'A'), (2, 'B')");
+        sql("INSERT INTO latest_delta VALUES (3, 'C'), (4, 'D')");
+
+        assertThat(
+                        sql(
+                                "SELECT * FROM latest_delta "
+                                        + "/*+ OPTIONS('scan.mode'='latest-delta') */"))
+                .containsExactlyInAnyOrder(Row.of(3, "C"), Row.of(4, "D"));
+    }
+
+    @Test
     public void testIncrementScanMode() throws Exception {
         sql(
                 "CREATE TABLE test_scan_mode (id INT PRIMARY KEY NOT ENFORCED, v STRING) WITH ('changelog-producer' = 'lookup')");
@@ -1307,6 +1320,25 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
         // Test selecting only _SEQUENCE_NUMBER, rowkind
         assertThat(sql("SELECT _SEQUENCE_NUMBER, rowkind FROM `test_table_seq$audit_log`"))
                 .containsExactlyInAnyOrder(Row.of(0L, "+I"), Row.of(1L, "+I"));
+    }
+
+    @Test
+    public void testReadBaseTableAfterAuditLogWithSequenceNumberEnabled() {
+        // Regression test: reading `t$audit_log` must not leak the internal
+        // KEY_VALUE_SEQUENCE_NUMBER_ENABLED option into subsequent reads of the base table.
+        sql(
+                "CREATE TABLE test_table_reuse (a int PRIMARY KEY NOT ENFORCED, b int, c AS a + b) "
+                        + "WITH ('table-read.sequence-number.enabled'='true');");
+        sql("INSERT INTO test_table_reuse VALUES (1, 2)");
+        sql("INSERT INTO test_table_reuse VALUES (3, 4)");
+
+        // First read the audit log
+        assertThat(sql("SELECT * FROM `test_table_reuse$audit_log`"))
+                .containsExactlyInAnyOrder(Row.of("+I", 0L, 1, 2, 3), Row.of("+I", 1L, 3, 4, 7));
+
+        // Then read the base table - must not include _SEQUENCE_NUMBER column.
+        assertThat(sql("SELECT * FROM `test_table_reuse`"))
+                .containsExactlyInAnyOrder(Row.of(1, 2, 3), Row.of(3, 4, 7));
     }
 
     @Test

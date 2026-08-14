@@ -20,14 +20,15 @@ import json
 import os
 import sys
 import unittest
+from decimal import Decimal
 
 import pandas as pd
 import pyarrow as pa
 from parameterized import parameterized
 from pypaimon.catalog.catalog_factory import CatalogFactory
 from pypaimon.data.generic_variant import GenericVariant
-from pypaimon.globalindex.global_index_scanner import GlobalIndexScanner
-from pypaimon.schema.data_types import VectorType
+from pypaimon.globalindex.data_evolution_global_index_scanner import DataEvolutionGlobalIndexScanner
+from pypaimon.schema.data_types import PyarrowFieldParser, VectorType
 from pypaimon.schema.schema import Schema
 from pypaimon.read.read_builder import ReadBuilder
 
@@ -66,6 +67,79 @@ class JavaPyReadWriteTest(unittest.TestCase):
             'warehouse': cls.warehouse
         })
         cls.catalog.create_database('default', True)
+
+    def test_read_java_dynamic_bucket_hash_index(self):
+        table = self.catalog.get_table(
+            'default.dynamic_hash_java_to_python'
+        )
+        read_builder = table.new_read_builder()
+        initial = read_builder.new_read().to_arrow(
+            read_builder.new_scan().plan().splits()
+        )
+        self.assertEqual(
+            {
+                'key1': ['hello-java'],
+                'key2': [42],
+                'value': ['java-old'],
+            },
+            initial.to_pydict(),
+        )
+
+        builder = table.new_batch_write_builder()
+        writer = builder.new_write()
+        writer.write_arrow(pa.table({
+            'key1': ['python-only', 'hello-java'],
+            'key2': pa.array([7, 42], type=pa.int64()),
+            'value': ['python-only', 'python-new'],
+        }))
+        commit = builder.new_commit()
+        commit.commit(writer.prepare_commit())
+        writer.close()
+        commit.close()
+
+        read_builder = table.new_read_builder()
+        result = table_sort_by(read_builder.new_read().to_arrow(
+            read_builder.new_scan().plan().splits()
+        ), 'key1')
+        self.assertEqual(
+            {
+                'key1': ['hello-java', 'python-only'],
+                'key2': [42, 7],
+                'value': ['python-new', 'python-only'],
+            },
+            result.to_pydict(),
+        )
+
+    def test_py_write_dynamic_bucket_hash_index(self):
+        table_name = 'default.dynamic_hash_python_to_java'
+        self.catalog.drop_table(table_name, True)
+        schema = Schema.from_pyarrow_schema(
+            pa.schema([
+                pa.field('key1', pa.string()),
+                pa.field('key2', pa.int64()),
+                pa.field('value', pa.string()),
+            ]),
+            primary_keys=['key1', 'key2'],
+            options={
+                'bucket': '-1',
+                'dynamic-bucket.target-row-num': '1',
+                'file.format': 'parquet',
+            },
+        )
+        self.catalog.create_table(table_name, schema, False)
+        table = self.catalog.get_table(table_name)
+
+        builder = table.new_batch_write_builder()
+        writer = builder.new_write()
+        writer.write_arrow(pa.table({
+            'key1': ['hello-java', 'python-only'],
+            'key2': pa.array([42, 7], type=pa.int64()),
+            'value': ['python-old', 'python-only'],
+        }))
+        commit = builder.new_commit()
+        commit.commit(writer.prepare_commit())
+        writer.close()
+        commit.close()
 
     @parameterized.expand(get_file_format_params())
     def test_py_write_read_append_table(self, file_format):
@@ -463,14 +537,16 @@ class JavaPyReadWriteTest(unittest.TestCase):
 
     def test_read_btree_raw_fallback(self):
         table = self.catalog.get_table('default.test_btree_raw_fallback')
-        fast_builder = table.new_read_builder()
+        fast_table = table.copy({'scalar-index.search-mode': 'fast'})
+        fast_builder = fast_table.new_read_builder()
         fast_predicate = fast_builder.new_predicate_builder().equal('k', 'k4')
         fast_builder.with_filter(fast_predicate)
         fast_result = fast_builder.new_read().to_arrow(
             fast_builder.new_scan().plan().splits())
         self.assertEqual(0, fast_result.num_rows)
 
-        full_table = table.copy({'global-index.search-mode': 'full'})
+        # full mode falls back to a raw scan for the unindexed k4 row
+        full_table = table.copy({'scalar-index.search-mode': 'full'})
         read_builder = full_table.new_read_builder()
         read_builder.with_filter(
             read_builder.new_predicate_builder().equal('k', 'k4'))
@@ -758,7 +834,7 @@ class JavaPyReadWriteTest(unittest.TestCase):
         read_builder = table.new_read_builder()
         predicate = predicate_factory(read_builder.new_predicate_builder())
 
-        scanner = GlobalIndexScanner.create(table, predicate=predicate)
+        scanner = DataEvolutionGlobalIndexScanner.create(table, predicate=predicate)
         self.assertIsNotNone(scanner)
         with scanner:
             result = scanner.scan(predicate)
@@ -786,7 +862,7 @@ class JavaPyReadWriteTest(unittest.TestCase):
                      .new_predicate_builder()
                      .greater_or_equal('k', 'key-295'))
 
-        scanner = GlobalIndexScanner.create(table, predicate=predicate)
+        scanner = DataEvolutionGlobalIndexScanner.create(table, predicate=predicate)
         self.assertIsNotNone(scanner)
         with scanner:
             result = scanner.scan(predicate)
@@ -804,7 +880,7 @@ class JavaPyReadWriteTest(unittest.TestCase):
         self.assertEqual(expected, actual)
 
         disabled_table = table.copy({budget_key: '0 b'})
-        disabled_scanner = GlobalIndexScanner.create(disabled_table, predicate=predicate)
+        disabled_scanner = DataEvolutionGlobalIndexScanner.create(disabled_table, predicate=predicate)
         self.assertIsNotNone(disabled_scanner)
         with disabled_scanner:
             disabled_result = disabled_scanner.scan(predicate)
@@ -1477,12 +1553,55 @@ class JavaPyReadWriteTest(unittest.TestCase):
                 {4: b'java-omega'},
             ],
         )
+        expected_additional_payloads = {
+            'boolean_payloads': {True: b'java-boolean'},
+            'compact_decimal_payloads': {
+                Decimal('12.34'): b'java-compact-decimal',
+            },
+            'high_decimal_payloads': {
+                Decimal('123456789012345678.90'): b'java-high-decimal',
+            },
+            'date_payloads': {
+                datetime.date(1969, 12, 31): b'java-date',
+            },
+            'time_payloads': {
+                datetime.time(12, 34, 56, 789000): b'java-time',
+            },
+            'binary_payloads': {
+                bytes([0, 255, 1, 2]): b'java-binary',
+            },
+            'varbinary_payloads': {
+                b'': b'java-varbinary',
+            },
+        }
+        for name, expected in expected_additional_payloads.items():
+            self.assertEqual(
+                [None if value is None else dict(value)
+                 for value in result.column(name).to_pylist()],
+                [expected, None, None, None],
+            )
 
     def test_write_map_blob_for_java(self):
         map_blob_type = pa.map_(pa.int32(), pa.large_binary())
+        boolean_map_blob_type = pa.map_(pa.bool_(), pa.large_binary())
+        compact_decimal_map_blob_type = pa.map_(
+            pa.decimal128(10, 2), pa.large_binary())
+        high_decimal_map_blob_type = pa.map_(
+            pa.decimal128(20, 2), pa.large_binary())
+        date_map_blob_type = pa.map_(pa.date32(), pa.large_binary())
+        time_map_blob_type = pa.map_(pa.time32('ms'), pa.large_binary())
+        binary_schema_type = pa.map_(pa.binary(4), pa.large_binary())
+        varbinary_schema_type = pa.map_(pa.binary(), pa.large_binary())
         pa_schema = pa.schema([
             ('id', pa.int32()),
             ('payloads', map_blob_type),
+            ('boolean_payloads', boolean_map_blob_type),
+            ('compact_decimal_payloads', compact_decimal_map_blob_type),
+            ('high_decimal_payloads', high_decimal_map_blob_type),
+            ('date_payloads', date_map_blob_type),
+            ('time_payloads', time_map_blob_type),
+            ('binary_payloads', binary_schema_type),
+            ('varbinary_payloads', varbinary_schema_type),
         ])
         schema = Schema.from_pyarrow_schema(
             pa_schema,
@@ -1492,6 +1611,9 @@ class JavaPyReadWriteTest(unittest.TestCase):
                 'bucket': '-1',
             },
         )
+        pa_schema = PyarrowFieldParser.from_paimon_schema(schema.fields)
+        binary_map_blob_type = pa_schema.field('binary_payloads').type
+        varbinary_map_blob_type = pa_schema.field('varbinary_payloads').type
         table_name = 'default.map_blob_python_test'
         self.catalog.drop_table(table_name, True)
         self.catalog.create_table(table_name, schema, False)
@@ -1507,6 +1629,51 @@ class JavaPyReadWriteTest(unittest.TestCase):
                     [(4, b'python-omega')],
                 ],
                 type=map_blob_type,
+            ),
+            'boolean_payloads': pa.array(
+                [[(True, b'python-boolean')], None, None, None],
+                type=boolean_map_blob_type,
+            ),
+            'compact_decimal_payloads': pa.array(
+                [[(Decimal('12.34'), b'python-compact-decimal')],
+                 None, None, None],
+                type=compact_decimal_map_blob_type,
+            ),
+            'high_decimal_payloads': pa.array(
+                [[(
+                    Decimal('123456789012345678.90'),
+                    b'python-high-decimal',
+                )], None, None, None],
+                type=high_decimal_map_blob_type,
+            ),
+            'date_payloads': pa.array(
+                [[(
+                    datetime.date(1969, 12, 31),
+                    b'python-date',
+                )], None, None, None],
+                type=date_map_blob_type,
+            ),
+            'time_payloads': pa.array(
+                [[(
+                    datetime.time(12, 34, 56, 789000),
+                    b'python-time',
+                )], None, None, None],
+                type=time_map_blob_type,
+            ),
+            'binary_payloads': pa.array(
+                [
+                    [
+                        (bytes([0, 255, 1, 2]), b'python-binary'),
+                    ],
+                    None,
+                    None,
+                    None,
+                ],
+                type=binary_map_blob_type,
+            ),
+            'varbinary_payloads': pa.array(
+                [[(b'', b'python-varbinary')], None, None, None],
+                type=varbinary_map_blob_type,
             ),
         }, schema=pa_schema)
         write_builder = table.new_batch_write_builder()
@@ -1532,13 +1699,40 @@ class JavaPyReadWriteTest(unittest.TestCase):
                 {4: b'python-omega'},
             ],
         )
+        expected_additional_payloads = {
+            'boolean_payloads': {True: b'python-boolean'},
+            'compact_decimal_payloads': {
+                Decimal('12.34'): b'python-compact-decimal',
+            },
+            'high_decimal_payloads': {
+                Decimal('123456789012345678.90'): b'python-high-decimal',
+            },
+            'date_payloads': {
+                datetime.date(1969, 12, 31): b'python-date',
+            },
+            'time_payloads': {
+                datetime.time(12, 34, 56, 789000): b'python-time',
+            },
+            'binary_payloads': {
+                bytes([0, 255, 1, 2]): b'python-binary',
+            },
+            'varbinary_payloads': {
+                b'': b'python-varbinary',
+            },
+        }
+        for name, expected in expected_additional_payloads.items():
+            self.assertEqual(
+                [None if value is None else dict(value)
+                 for value in result.column(name).to_pylist()],
+                [expected, None, None, None],
+            )
 
     def test_compact_conflict_shard_update(self):
         """
         1. Java writes 5 base files (testCompactConflictWriteBase)
         2. pypaimon ShardTableUpdator scans table, prepares evolution
         3. Java runs compact (testCompactConflictRunCompact)
-        4. pypaimon commits stale evolution -> conflict detected, raises RuntimeError
+        4. pypaimon rebases the stale evolution files and commits successfully
         """
         import subprocess
 
@@ -1584,13 +1778,18 @@ class JavaPyReadWriteTest(unittest.TestCase):
                          f"Java compact failed:\n{result.stdout}\n{result.stderr}")
         print("Java compact completed")
 
-        # Step 4: pypaimon commits stale evolution -> conflict detected
+        # Step 4: pypaimon rewrites stale evolution files against the compacted range
         tc = wb.new_commit()
-        with self.assertRaises(RuntimeError) as ctx:
-            tc.commit(stale_commit_msgs)
-        self.assertIn("conflict", str(ctx.exception))
+        tc.commit(stale_commit_msgs)
         tc.close()
-        print(f"Conflict detected as expected: {ctx.exception}")
+
+        read_builder = table.new_read_builder()
+        result = read_builder.new_read().to_arrow(
+            read_builder.new_scan().plan().splits())
+        self.assertEqual(
+            rows_read,
+            sum(value is not None for value in result.column('f2').to_pylist()),
+        )
 
     def test_blob_compact_conflict_update(self):
         import subprocess

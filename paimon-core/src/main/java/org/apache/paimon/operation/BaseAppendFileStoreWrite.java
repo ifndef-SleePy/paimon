@@ -86,6 +86,7 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
     private @Nullable BlobFetchMetrics blobFetchMetrics;
     private RowType writeType;
     private @Nullable List<String> writeCols;
+    private FileSource fileSource = FileSource.APPEND;
     private boolean forceBufferSpill = false;
 
     public BaseAppendFileStoreWrite(
@@ -160,6 +161,7 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
                 options.targetFileSize(false),
                 options.blobTargetFileSize(),
                 options.vectorTargetFileSize(),
+                options.targetFileRowNum(),
                 writeType,
                 writeCols,
                 restoredMaxSeqNumber,
@@ -180,7 +182,13 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
                 options.statsDenseStore(),
                 options.dataEvolutionEnabled(),
                 rowSidecarFileFormat(),
-                blobContext);
+                blobContext,
+                fileSource);
+    }
+
+    public BaseAppendFileStoreWrite withFileSource(FileSource fileSource) {
+        this.fileSource = fileSource;
+        return this;
     }
 
     @Override
@@ -312,7 +320,8 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
                 options.asyncFileWrite(),
                 options.statsDenseStore(),
                 rowType.equals(writeType) ? null : writeType.getFieldNames(),
-                rowSidecarFileFormat());
+                rowSidecarFileFormat(),
+                Long.MAX_VALUE);
     }
 
     @Nullable

@@ -90,6 +90,7 @@ class StartupMode(str, Enum):
 class GlobalIndexColumnUpdateAction(str, Enum):
     THROW_ERROR = "THROW_ERROR"
     DROP_PARTITION_INDEX = "DROP_PARTITION_INDEX"
+    IGNORE = "IGNORE"
 
 
 class GlobalIndexSearchMode(str, Enum):
@@ -123,6 +124,7 @@ class CoreOptions:
         "partial-update.remove-record-on-sequence-group",
         "rowkind.field",
         "primary-key",
+        "primary-key.nullable",
         "partition",
         "dynamic-bucket.initial-buckets",
         "force-lookup",
@@ -207,6 +209,16 @@ class CoreOptions:
         )
     )
 
+    PRIMARY_KEY_NULLABLE: ConfigOption[bool] = (
+        ConfigOptions.key("primary-key.nullable")
+        .boolean_type()
+        .default_value(False)
+        .with_description(
+            "Whether primary key fields can contain null values. Null values "
+            "use null-safe equality when records are merged."
+        )
+    )
+
     DYNAMIC_BUCKET_TARGET_ROW_NUM: ConfigOption[int] = (
         ConfigOptions.key("dynamic-bucket.target-row-num")
         .int_type()
@@ -223,6 +235,46 @@ class CoreOptions:
         .default_value(-1)
         .with_description(
             "In dynamic bucket mode, max buckets per partition. -1 means unlimited."
+        )
+    )
+
+    POSTPONE_BATCH_WRITE_FIXED_BUCKET: ConfigOption[bool] = (
+        ConfigOptions.key("postpone.batch-write-fixed-bucket")
+        .boolean_type()
+        .default_value(True)
+        .with_description(
+            "Whether to write data into fixed buckets for batch writes to a "
+            "postpone bucket table."
+        )
+    )
+
+    POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM: ConfigOption[int] = (
+        ConfigOptions.key("postpone.batch-write-fixed-bucket.max-parallelism")
+        .int_type()
+        .default_value(2048)
+        .with_description(
+            "Maximum bucket number inferred for a postpone batch write."
+        )
+    )
+
+    POSTPONE_TARGET_ROW_NUM_PER_BUCKET: ConfigOption[int] = (
+        ConfigOptions.key("postpone.target-row-num-per-bucket")
+        .long_type()
+        .no_default_value()
+        .with_description(
+            "Target row number per bucket when batch writing a postpone "
+            "partition without real bucket data."
+        )
+    )
+
+    POSTPONE_TARGET_SIZE_PER_BUCKET: ConfigOption[MemorySize] = (
+        ConfigOptions.key("postpone.target-size-per-bucket")
+        .memory_type()
+        .default_value(MemorySize.parse("1 gb"))
+        .with_description(
+            "Target uncompressed input size per bucket when batch writing a "
+            "postpone partition without real bucket data. This option is "
+            "ignored when postpone.target-row-num-per-bucket is configured."
         )
     )
 
@@ -387,6 +439,17 @@ class CoreOptions:
         .memory_type()
         .no_default_value()
         .with_description("The target file size for data files.")
+    )
+
+    TARGET_FILE_ROW_NUM: ConfigOption[int] = (
+        ConfigOptions.key("target-file-row-num")
+        .long_type()
+        .default_value((1 << 63) - 1)
+        .with_description(
+            "Target number of rows per newly written data file. PyPaimon format-table "
+            "and data-evolution append-table writers split files at this limit; "
+            "primary-key, blob and vector writers fail fast when this option is enabled."
+        )
     )
 
     BLOB_TARGET_FILE_SIZE: ConfigOption[MemorySize] = (
@@ -647,6 +710,18 @@ class CoreOptions:
         .with_description("Whether to enable data evolution.")
     )
 
+    DATA_EVOLUTION_ROW_ID_CONFLICT_REWRITE_MAX_SIZE: ConfigOption[MemorySize] = (
+        ConfigOptions.key("data-evolution.row-id-conflict-rewrite.max-size")
+        .memory_type()
+        .default_value(MemorySize.of_mebi_bytes(256))
+        .with_description(
+            "Maximum total size of current data files whose row-id ranges "
+            "PyPaimon may automatically rebase staged updates against when "
+            "a concurrent compaction changes file boundaries. Set to 0 B "
+            "to disable."
+        )
+    )
+
     DATA_EVOLUTION_ROW_SIDECAR_ENABLED: ConfigOption[bool] = (
         ConfigOptions.key("data-evolution.row-sidecar.enabled")
         .boolean_type()
@@ -719,11 +794,29 @@ class CoreOptions:
     GLOBAL_INDEX_SEARCH_MODE: ConfigOption[GlobalIndexSearchMode] = (
         ConfigOptions.key("global-index.search-mode")
         .enum_type(GlobalIndexSearchMode)
+        .no_default_value()
+        .with_description("Fallback search mode for global index queries.")
+    )
+
+    SCALAR_INDEX_SEARCH_MODE: ConfigOption[GlobalIndexSearchMode] = (
+        ConfigOptions.key("scalar-index.search-mode")
+        .enum_type(GlobalIndexSearchMode)
         .default_value(GlobalIndexSearchMode.FAST)
-        .with_description(
-            "Search mode for global index queries. "
-            "Supported values are 'fast', 'full', and 'detail'."
-        )
+        .with_description("Search mode for scalar index queries.")
+    )
+
+    VECTOR_INDEX_SEARCH_MODE: ConfigOption[GlobalIndexSearchMode] = (
+        ConfigOptions.key("vector-index.search-mode")
+        .enum_type(GlobalIndexSearchMode)
+        .default_value(GlobalIndexSearchMode.FAST)
+        .with_description("Search mode for vector index queries.")
+    )
+
+    FULL_TEXT_INDEX_SEARCH_MODE: ConfigOption[GlobalIndexSearchMode] = (
+        ConfigOptions.key("full-text-index.search-mode")
+        .enum_type(GlobalIndexSearchMode)
+        .default_value(GlobalIndexSearchMode.FAST)
+        .with_description("Search mode for full-text index queries.")
     )
 
     GLOBAL_INDEX_EXTERNAL_PATH: ConfigOption[str] = (
@@ -787,7 +880,8 @@ class CoreOptions:
         .default_value(GlobalIndexColumnUpdateAction.THROW_ERROR)
         .with_description(
             "Defines the action to take when an update modifies columns that "
-            "are covered by a global index."
+            "are covered by a global index. IGNORE leaves existing index files "
+            "unchanged and may make the index stale."
         )
     )
 
@@ -999,6 +1093,10 @@ class CoreOptions:
     def from_dict(options: dict) -> 'CoreOptions':
         return CoreOptions(Options(options))
 
+    @staticmethod
+    def primary_key_nullable_from_dict(options: dict) -> bool:
+        return Options(options).get(CoreOptions.PRIMARY_KEY_NULLABLE)
+
     def path(self, default=None):
         return self.options.get(CoreOptions.PATH, default)
 
@@ -1017,11 +1115,41 @@ class CoreOptions:
     def bucket_key(self, default=None):
         return self.options.get(CoreOptions.BUCKET_KEY, default)
 
+    def primary_key_nullable(self, default=None):
+        return self.options.get(CoreOptions.PRIMARY_KEY_NULLABLE, default)
+
     def dynamic_bucket_target_row_num(self, default=None):
         return self.options.get(CoreOptions.DYNAMIC_BUCKET_TARGET_ROW_NUM, default)
 
     def dynamic_bucket_max_buckets(self, default=None):
         return self.options.get(CoreOptions.DYNAMIC_BUCKET_MAX_BUCKETS, default)
+
+    def postpone_batch_write_fixed_bucket(self, default=None):
+        return self.options.get(
+            CoreOptions.POSTPONE_BATCH_WRITE_FIXED_BUCKET, default
+        )
+
+    def postpone_batch_write_fixed_bucket_max_parallelism(self, default=None):
+        return self.options.get(
+            CoreOptions.POSTPONE_BATCH_WRITE_FIXED_BUCKET_MAX_PARALLELISM,
+            default,
+        )
+
+    def postpone_target_row_num_per_bucket(self, default=None):
+        return self.options.get(
+            CoreOptions.POSTPONE_TARGET_ROW_NUM_PER_BUCKET, default
+        )
+
+    def postpone_target_size_per_bucket(self, default=None):
+        if default is not None and not isinstance(default, MemorySize):
+            default = (
+                MemorySize.of_bytes(default)
+                if isinstance(default, int)
+                else MemorySize.parse(default)
+            )
+        return self.options.get(
+            CoreOptions.POSTPONE_TARGET_SIZE_PER_BUCKET, default
+        ).get_bytes()
 
     def scan_manifest_parallelism(self, default=None):
         return self.options.get(CoreOptions.SCAN_MANIFEST_PARALLELISM, default)
@@ -1114,6 +1242,9 @@ class CoreOptions:
                                 MemorySize.of_mebi_bytes(
                                     128 if has_primary_key else 256) if default is None else MemorySize.parse(
                                     default)).get_bytes()
+
+    def target_file_row_num(self):
+        return self.options.get(CoreOptions.TARGET_FILE_ROW_NUM)
 
     def blob_target_file_size(self, default=None):
         """
@@ -1226,6 +1357,13 @@ class CoreOptions:
 
     def data_evolution_enabled(self, default=None):
         return self.options.get(CoreOptions.DATA_EVOLUTION_ENABLED, default)
+
+    def data_evolution_row_id_conflict_rewrite_max_size(self, default=None):
+        value = self.options.get(
+            CoreOptions.DATA_EVOLUTION_ROW_ID_CONFLICT_REWRITE_MAX_SIZE,
+            default,
+        )
+        return value.get_bytes()
 
     def data_evolution_row_sidecar_enabled(self, default=None):
         return self.options.get(CoreOptions.DATA_EVOLUTION_ROW_SIDECAR_ENABLED, default)
@@ -1355,6 +1493,21 @@ class CoreOptions:
 
     def global_index_search_mode(self):
         return self.options.get(CoreOptions.GLOBAL_INDEX_SEARCH_MODE)
+
+    def scalar_index_search_mode(self):
+        return self._family_index_search_mode(CoreOptions.SCALAR_INDEX_SEARCH_MODE)
+
+    def vector_index_search_mode(self):
+        return self._family_index_search_mode(CoreOptions.VECTOR_INDEX_SEARCH_MODE)
+
+    def full_text_index_search_mode(self):
+        return self._family_index_search_mode(CoreOptions.FULL_TEXT_INDEX_SEARCH_MODE)
+
+    def _family_index_search_mode(self, option):
+        if self.options.contains(option):
+            return self.options.get(option)
+        global_mode = self.global_index_search_mode()
+        return global_mode if global_mode is not None else self.options.get(option)
 
     def global_index_external_path(self, default=None):
         value = self.options.get(CoreOptions.GLOBAL_INDEX_EXTERNAL_PATH, default)

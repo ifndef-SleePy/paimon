@@ -21,6 +21,7 @@ package org.apache.parquet.filter2.predicate;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Decimal;
 import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.format.parquet.ParquetSchemaConverter;
 import org.apache.paimon.predicate.FieldRef;
 import org.apache.paimon.predicate.FunctionVisitor;
 import org.apache.paimon.predicate.LeafPredicate;
@@ -31,6 +32,7 @@ import org.apache.paimon.types.BinaryType;
 import org.apache.paimon.types.BlobType;
 import org.apache.paimon.types.BooleanType;
 import org.apache.paimon.types.CharType;
+import org.apache.paimon.types.DataTypeRoot;
 import org.apache.paimon.types.DataTypeVisitor;
 import org.apache.paimon.types.DateType;
 import org.apache.paimon.types.DecimalType;
@@ -56,9 +58,12 @@ import org.apache.parquet.filter2.predicate.Operators.FloatColumn;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
+import org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.math.BigDecimal;
@@ -305,21 +310,9 @@ public class ParquetFilters {
                 }
             }
 
-            if (value instanceof Number) {
-                if (value instanceof Byte) {
-                    return ((Byte) value).intValue();
-                } else if (value instanceof Short) {
-                    return ((Short) value).intValue();
-                }
-                return (Comparable<?>) value;
-            } else if (value instanceof String) {
-                return Binary.fromString((String) value);
-            } else if (value instanceof BinaryString) {
-                return Binary.fromString(value.toString());
-            } else if (value instanceof byte[]) {
-                return Binary.fromReusedByteArray((byte[]) value);
-            } else if (value instanceof Timestamp) {
+            if (value instanceof Timestamp) {
                 Timestamp timestamp = (Timestamp) value;
+                timestampPrimitiveType(fieldRef, fileSchema, caseSensitive);
                 int precision = getTimestampPrecision(type);
                 if (precision <= 3) {
                     // milliseconds
@@ -332,6 +325,81 @@ public class ParquetFilters {
                 throw new UnsupportedOperationException();
             }
 
+            // The literal has to speak whatever the file holds, not what the table declares.
+            switch (pushdownTarget(fieldRef, fileSchema, caseSensitive).type) {
+                case BOOLEAN:
+                    return toBoolean(value);
+                case INT32:
+                    return toInt(value);
+                case INT64:
+                    return toLong(value);
+                case FLOAT:
+                    return toFloat(value);
+                case DOUBLE:
+                    return toDouble(value);
+                case BINARY:
+                case FIXED_LEN_BYTE_ARRAY:
+                    return toBinary(value);
+                default:
+                    throw new UnsupportedOperationException();
+            }
+        }
+
+        private Comparable<?> toBoolean(Object value) {
+            if (value instanceof Boolean) {
+                return (Boolean) value;
+            }
+            throw new UnsupportedOperationException();
+        }
+
+        private Comparable<?> toInt(Object value) {
+            long asLong = toLongValue(value);
+            if (asLong < Integer.MIN_VALUE || asLong > Integer.MAX_VALUE) {
+                // Truncating would change what the predicate means: `< 3000000000` would become
+                // `< -1294967296` and prune row groups that hold matching rows.
+                throw new UnsupportedOperationException();
+            }
+            return (int) asLong;
+        }
+
+        private Comparable<?> toLong(Object value) {
+            return toLongValue(value);
+        }
+
+        private long toLongValue(Object value) {
+            if (value instanceof Byte
+                    || value instanceof Short
+                    || value instanceof Integer
+                    || value instanceof Long) {
+                return ((Number) value).longValue();
+            }
+            throw new UnsupportedOperationException();
+        }
+
+        private Comparable<?> toFloat(Object value) {
+            if (value instanceof Float) {
+                return (Float) value;
+            }
+            throw new UnsupportedOperationException();
+        }
+
+        private Comparable<?> toDouble(Object value) {
+            // Float widens to double exactly; a double literal must never be narrowed to float,
+            // which would round the bound and drop rows that sit next to it.
+            if (value instanceof Float || value instanceof Double) {
+                return ((Number) value).doubleValue();
+            }
+            throw new UnsupportedOperationException();
+        }
+
+        private Comparable<?> toBinary(Object value) {
+            if (value instanceof String) {
+                return Binary.fromString((String) value);
+            } else if (value instanceof BinaryString) {
+                return Binary.fromString(value.toString());
+            } else if (value instanceof byte[]) {
+                return Binary.fromReusedByteArray((byte[]) value);
+            }
             throw new UnsupportedOperationException();
         }
 
@@ -383,23 +451,7 @@ public class ParquetFilters {
 
     private static PrimitiveType decimalPrimitiveType(
             FieldRef fieldRef, MessageType fileSchema, boolean caseSensitive) {
-        Type matched = null;
-        // Paimon predicates currently reference top-level fields only. Nested field
-        // predicates are rejected before reaching the format reader.
-        for (Type field : fileSchema.getFields()) {
-            if (caseSensitive
-                    ? field.getName().equals(fieldRef.name())
-                    : field.getName().equalsIgnoreCase(fieldRef.name())) {
-                matched = field;
-                break;
-            }
-        }
-
-        if (matched == null || !matched.isPrimitive()) {
-            throw new UnsupportedOperationException();
-        }
-
-        PrimitiveType primitiveType = matched.asPrimitiveType();
+        PrimitiveType primitiveType = primitiveType(fieldRef, fileSchema, caseSensitive);
         LogicalTypeAnnotation logicalType = primitiveType.getLogicalTypeAnnotation();
         if (!(logicalType instanceof DecimalLogicalTypeAnnotation)) {
             throw new UnsupportedOperationException();
@@ -411,6 +463,214 @@ public class ParquetFilters {
             throw new UnsupportedOperationException();
         }
         return primitiveType;
+    }
+
+    private static PrimitiveType timestampPrimitiveType(
+            FieldRef fieldRef, MessageType fileSchema, boolean caseSensitive) {
+        PrimitiveType primitiveType = primitiveType(fieldRef, fileSchema, caseSensitive);
+        if (primitiveType.getPrimitiveTypeName() != PrimitiveType.PrimitiveTypeName.INT64) {
+            throw new UnsupportedOperationException();
+        }
+
+        LogicalTypeAnnotation logicalType = primitiveType.getLogicalTypeAnnotation();
+        if (logicalType == null) {
+            return primitiveType;
+        }
+        if (!(logicalType instanceof TimestampLogicalTypeAnnotation)) {
+            throw new UnsupportedOperationException();
+        }
+
+        TimestampLogicalTypeAnnotation timestampType = (TimestampLogicalTypeAnnotation) logicalType;
+        int precision = getTimestampPrecision(fieldRef.type());
+        LogicalTypeAnnotation.TimeUnit expectedUnit =
+                precision <= 3
+                        ? LogicalTypeAnnotation.TimeUnit.MILLIS
+                        : LogicalTypeAnnotation.TimeUnit.MICROS;
+        boolean expectedAdjustedToUtc = fieldRef.type() instanceof LocalZonedTimestampType;
+        if (timestampType.getUnit() != expectedUnit
+                || timestampType.isAdjustedToUTC() != expectedAdjustedToUtc) {
+            throw new UnsupportedOperationException();
+        }
+        return primitiveType;
+    }
+
+    private static PrimitiveType primitiveType(
+            FieldRef fieldRef, MessageType fileSchema, boolean caseSensitive) {
+        PrimitiveType matched = findPrimitiveType(fieldRef, fileSchema, caseSensitive);
+        if (matched == null) {
+            throw new UnsupportedOperationException();
+        }
+        return matched;
+    }
+
+    /**
+     * The file's column for {@code fieldRef}, or null when the file has no such column. A column
+     * that exists but is not primitive cannot carry a predicate at all, so it is rejected outright.
+     */
+    @Nullable
+    private static PrimitiveType findPrimitiveType(
+            FieldRef fieldRef, MessageType fileSchema, boolean caseSensitive) {
+        // Paimon predicates currently reference top-level fields only. Nested field
+        // predicates are rejected before reaching the format reader.
+        for (Type field : fileSchema.getFields()) {
+            if (caseSensitive
+                    ? field.getName().equals(fieldRef.name())
+                    : field.getName().equalsIgnoreCase(fieldRef.name())) {
+                if (!field.isPrimitive()) {
+                    throw new UnsupportedOperationException();
+                }
+                return field.asPrimitiveType();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The physical type a pushed-down predicate on {@code fieldRef} has to be expressed in. A
+     * Format Table takes its schema from the metastore while its files are written by someone else,
+     * so the declared type is not necessarily what the file holds and the predicate has to follow
+     * the file.
+     *
+     * <p>Falls back to what the table declares when the file has no such column: parquet-mr skips
+     * validation for a column it cannot find and evaluates it as null, so the predicate still
+     * prunes.
+     *
+     * <p>Throws {@link UnsupportedOperationException} when the two types cannot be reconciled
+     * without changing what the predicate means. {@link #convert} swallows that and drops the
+     * predicate, which costs pruning but never rows.
+     */
+    private static PushdownTarget pushdownTarget(
+            FieldRef fieldRef, MessageType fileSchema, boolean caseSensitive) {
+        PrimitiveType.PrimitiveTypeName[] acceptable = acceptableTypes(fieldRef.type());
+        PrimitiveType fileType = findPrimitiveType(fieldRef, fileSchema, caseSensitive);
+        if (fileType == null) {
+            return new PushdownTarget(fieldRef.name(), acceptable[0]);
+        }
+
+        validateBigIntCompatibility(fieldRef, fileType);
+
+        if (ParquetSchemaConverter.isUnsignedInt(fileType)) {
+            // An unsigned column orders its statistics unsigned, so a signed bound would prune the
+            // wrong row groups. The read still widens the column; only the pruning is given up.
+            throw new UnsupportedOperationException();
+        }
+
+        validateNarrowIntegerPushdown(fieldRef, fileType);
+
+        for (PrimitiveType.PrimitiveTypeName candidate : acceptable) {
+            if (fileType.getPrimitiveTypeName() == candidate) {
+                return new PushdownTarget(fileType.getName(), candidate);
+            }
+        }
+        throw new UnsupportedOperationException();
+    }
+
+    /** Reject physical integer annotations that cannot be represented as BIGINT. */
+    private static void validateBigIntCompatibility(FieldRef fieldRef, PrimitiveType fileType) {
+        if (fieldRef.type().getTypeRoot() == DataTypeRoot.BIGINT
+                && !ParquetSchemaConverter.isBigIntLogicalTypeCompatible(fileType)) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    /** Reject physical integer ranges that the declared narrow type cannot preserve on read. */
+    private static void validateNarrowIntegerPushdown(FieldRef fieldRef, PrimitiveType fileType) {
+        int maxBitWidth;
+        switch (fieldRef.type().getTypeRoot()) {
+            case TINYINT:
+                maxBitWidth = 8;
+                break;
+            case SMALLINT:
+                maxBitWidth = 16;
+                break;
+            default:
+                return;
+        }
+
+        LogicalTypeAnnotation logicalType = fileType.getLogicalTypeAnnotation();
+        if (!(logicalType instanceof LogicalTypeAnnotation.IntLogicalTypeAnnotation)) {
+            throw new UnsupportedOperationException();
+        }
+
+        LogicalTypeAnnotation.IntLogicalTypeAnnotation intType =
+                (LogicalTypeAnnotation.IntLogicalTypeAnnotation) logicalType;
+        if (!intType.isSigned() || intType.getBitWidth() > maxBitWidth) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    /**
+     * The file column a predicate has to name and the type it has to speak. The name matters in
+     * case-insensitive mode: parquet-mr resolves a predicate against the file by exact column path,
+     * so a predicate carrying the metastore's spelling of a column that the file spells differently
+     * reads as a column the file does not have - which the statistics filter takes for all-null and
+     * prunes away, silently losing every row.
+     */
+    private static class PushdownTarget {
+
+        private final String name;
+        private final PrimitiveType.PrimitiveTypeName type;
+
+        private PushdownTarget(String name, PrimitiveType.PrimitiveTypeName type) {
+            this.name = name;
+            this.type = type;
+        }
+    }
+
+    /**
+     * The physical types a predicate on this Paimon type can be expressed in, most preferred first.
+     * The head is what Paimon itself writes; the tail is a different type the vectorized reader
+     * accepts without changing predicate semantics. Lossy narrowing is excluded even when the file
+     * can be read, because filtering happens before the reader converts the value.
+     */
+    private static PrimitiveType.PrimitiveTypeName[] acceptableTypes(
+            org.apache.paimon.types.DataType type) {
+        switch (type.getTypeRoot()) {
+            case BOOLEAN:
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.BOOLEAN
+                };
+            case TINYINT:
+            case SMALLINT:
+                // INT64 is lossy; INT32 annotations are validated by pushdownTarget.
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.INT32
+                };
+            case INTEGER:
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.INT32, PrimitiveType.PrimitiveTypeName.INT64
+                };
+            case BIGINT:
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.INT64, PrimitiveType.PrimitiveTypeName.INT32
+                };
+            case FLOAT:
+                // A DOUBLE file value may round to the predicate's FLOAT value only after reading.
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.FLOAT
+                };
+            case DOUBLE:
+                // A double bound cannot be narrowed to float without rounding it, so a FLOAT file
+                // column is read but never filtered on.
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.DOUBLE
+                };
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.INT32
+                };
+            case CHAR:
+            case VARCHAR:
+            case BINARY:
+            case VARBINARY:
+                return new PrimitiveType.PrimitiveTypeName[] {
+                    PrimitiveType.PrimitiveTypeName.BINARY,
+                    PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
+                };
+            default:
+                throw new UnsupportedOperationException();
+        }
     }
 
     private static int getTimestampPrecision(org.apache.paimon.types.DataType type) {
@@ -426,81 +686,101 @@ public class ParquetFilters {
             implements DataTypeVisitor<Operators.Column<?>> {
 
         private final FieldRef fieldRef;
-        private final String name;
         private final MessageType fileSchema;
         private final boolean caseSensitive;
 
         public ConvertToColumnTypeVisitor(
                 FieldRef fieldRef, MessageType fileSchema, boolean caseSensitive) {
             this.fieldRef = fieldRef;
-            this.name = fieldRef.name();
             this.fileSchema = fileSchema;
             this.caseSensitive = caseSensitive;
         }
 
+        /** The column typed after the file, not after what the table declares. */
+        private Operators.Column<?> column() {
+            PushdownTarget target = pushdownTarget(fieldRef, fileSchema, caseSensitive);
+            switch (target.type) {
+                case BOOLEAN:
+                    return FilterApi.booleanColumn(target.name);
+                case INT32:
+                    return FilterApi.intColumn(target.name);
+                case INT64:
+                    return FilterApi.longColumn(target.name);
+                case FLOAT:
+                    return FilterApi.floatColumn(target.name);
+                case DOUBLE:
+                    return FilterApi.doubleColumn(target.name);
+                case BINARY:
+                case FIXED_LEN_BYTE_ARRAY:
+                    return FilterApi.binaryColumn(target.name);
+                default:
+                    throw new UnsupportedOperationException();
+            }
+        }
+
         @Override
         public Operators.Column<?> visit(CharType charType) {
-            return FilterApi.binaryColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(VarCharType varCharType) {
-            return FilterApi.binaryColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(BooleanType booleanType) {
-            return FilterApi.booleanColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(BinaryType binaryType) {
-            return FilterApi.binaryColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(VarBinaryType varBinaryType) {
-            return FilterApi.binaryColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(TinyIntType tinyIntType) {
-            return FilterApi.intColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(SmallIntType smallIntType) {
-            return FilterApi.intColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(IntType intType) {
-            return FilterApi.intColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(BigIntType bigIntType) {
-            return FilterApi.longColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(FloatType floatType) {
-            return FilterApi.floatColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(DoubleType doubleType) {
-            return FilterApi.doubleColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(DateType dateType) {
-            return FilterApi.intColumn(name);
+            return column();
         }
 
         @Override
         public Operators.Column<?> visit(TimeType timeType) {
-            return FilterApi.intColumn(name);
+            return column();
         }
 
         @Override
@@ -508,12 +788,12 @@ public class ParquetFilters {
             PrimitiveType primitiveType = decimalPrimitiveType(fieldRef, fileSchema, caseSensitive);
             switch (primitiveType.getPrimitiveTypeName()) {
                 case INT32:
-                    return FilterApi.intColumn(fieldRef.name());
+                    return FilterApi.intColumn(primitiveType.getName());
                 case INT64:
-                    return FilterApi.longColumn(fieldRef.name());
+                    return FilterApi.longColumn(primitiveType.getName());
                 case BINARY:
                 case FIXED_LEN_BYTE_ARRAY:
-                    return FilterApi.binaryColumn(fieldRef.name());
+                    return FilterApi.binaryColumn(primitiveType.getName());
                 default:
                     throw new UnsupportedOperationException();
             }
@@ -523,7 +803,8 @@ public class ParquetFilters {
         public Operators.Column<?> visit(TimestampType timestampType) {
             int precision = timestampType.getPrecision();
             if (precision <= 6) {
-                return FilterApi.longColumn(name);
+                return FilterApi.longColumn(
+                        timestampPrimitiveType(fieldRef, fileSchema, caseSensitive).getName());
             }
             // precision > 6 uses INT96, not supported for filter pushdown
             throw new UnsupportedOperationException();
@@ -533,7 +814,8 @@ public class ParquetFilters {
         public Operators.Column<?> visit(LocalZonedTimestampType localZonedTimestampType) {
             int precision = localZonedTimestampType.getPrecision();
             if (precision <= 6) {
-                return FilterApi.longColumn(name);
+                return FilterApi.longColumn(
+                        timestampPrimitiveType(fieldRef, fileSchema, caseSensitive).getName());
             }
             // precision > 6 uses INT96, not supported for filter pushdown
             throw new UnsupportedOperationException();

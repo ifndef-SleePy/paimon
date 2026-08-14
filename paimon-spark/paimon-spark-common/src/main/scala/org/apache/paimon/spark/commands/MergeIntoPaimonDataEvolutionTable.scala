@@ -39,7 +39,7 @@ import org.apache.paimon.table.sink.{CommitMessage, CommitMessageImpl}
 import org.apache.paimon.table.source.DataSplit
 import org.apache.paimon.table.source.snapshot.SnapshotReader
 import org.apache.paimon.table.source.snapshot.TimeTravelUtil
-import org.apache.paimon.types.{BlobType, DataTypeRoot, RowType}
+import org.apache.paimon.types.{BlobType, RowType}
 import org.apache.paimon.types.VectorType.isVectorStoreFile
 
 import org.apache.spark.internal.Logging
@@ -287,9 +287,16 @@ case class MergeIntoPaimonDataEvolutionTable(
       if (readSnapshot != null) {
         writer.rowIdCheckConflict(readSnapshot.id())
       }
-      writer.commit(
-        matchedResult.commitMessages ++ deleteCommit ++ insertCommit,
-        Snapshot.Operation.MERGE)
+      DataEvolutionRowIdConflictCommitter.commit(
+        sparkSession,
+        table,
+        targetRelation,
+        writer,
+        matchedResult.commitMessages,
+        deleteCommit ++ insertCommit,
+        if (readSnapshot == null) -1L else readSnapshot.id(),
+        Snapshot.Operation.MERGE
+      )
     } finally {
       targetActionCleanup()
       if (persistSourceDss.isDefined) {
@@ -430,15 +437,6 @@ case class MergeIntoPaimonDataEvolutionTable(
     val rawBlobFieldNames = rawBlobFields
       .map(_.name())
       .toSet
-    val rawNestedBlobFieldNames = rawBlobFields
-      .filter(
-        field => {
-          val root = field.`type`().getTypeRoot
-          root == DataTypeRoot.ARRAY || root == DataTypeRoot.MAP
-        })
-      .map(_.name())
-      .toSet
-
     def isRawBlobUpdateColumn(attr: AttributeReference): Boolean = {
       rawBlobFieldNames.exists(rawBlobFieldName => resolver(rawBlobFieldName, attr.name))
     }
@@ -457,17 +455,6 @@ case class MergeIntoPaimonDataEvolutionTable(
             None
           }
       }.toSet
-    }
-
-    val modifiedRawNestedBlobColumnNames = matchedActions
-      .collect { case action: UpdateAction => modifiedRawBlobNames(action) }
-      .flatten
-      .filter(name => rawNestedBlobFieldNames.exists(blobName => resolver(blobName, name)))
-      .toSet
-    if (modifiedRawNestedBlobColumnNames.nonEmpty) {
-      throw new UnsupportedOperationException(
-        "Should not append/update raw-data ARRAY<BLOB> or MAP<X, BLOB> column through MERGE INTO: " +
-          modifiedRawNestedBlobColumnNames.toSeq.sorted.mkString(", "))
     }
 
     val rawBlobMarkerNames =
@@ -926,6 +913,12 @@ case class MergeIntoPaimonDataEvolutionTable(
   }
 
   private def checkUpdateResult(updateCommit: Seq[CommitMessage]): Seq[CommitMessage] = {
+    if (
+      table.coreOptions().globalIndexColumnUpdateAction() == GlobalIndexColumnUpdateAction.IGNORE
+    ) {
+      return updateCommit
+    }
+
     val affectedParts: Set[BinaryRow] = updateCommit.map(_.partition()).toSet
     val rowType = table.rowType()
 
@@ -1060,14 +1053,13 @@ object MergeIntoPaimonDataEvolutionTable {
         val snapshotId = snapshot.id().toString
         if (
           configuredSnapshotId.contains(snapshotId) &&
-          fullSearchMode.equalsIgnoreCase(
-            table.options().get(CoreOptions.GLOBAL_INDEX_SEARCH_MODE.key()))
+          table.coreOptions().scalarIndexSearchMode() == CoreOptions.GlobalIndexSearchMode.FULL
         ) {
           (v2Table, relation)
         } else {
           val dynamicOptions = new JHashMap[String, String]()
           timeTravelOptionKeys.foreach(dynamicOptions.put(_, null))
-          dynamicOptions.put(CoreOptions.GLOBAL_INDEX_SEARCH_MODE.key(), fullSearchMode)
+          dynamicOptions.put(CoreOptions.SCALAR_INDEX_SEARCH_MODE.key(), fullSearchMode)
           dynamicOptions.put(CoreOptions.SCAN_SNAPSHOT_ID.key(), snapshotId)
 
           val scanTable = SparkTable.of(table.copy(dynamicOptions))

@@ -24,7 +24,6 @@ import org.apache.paimon.codegen.RecordComparator;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
-import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
@@ -49,6 +48,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -117,6 +117,16 @@ public class ChainGroupReadTable extends FallbackReadFileStoreTable {
 
     private DataTableScan newDeltaScan(Function<FileStoreTable, DataTableScan> scanCreator) {
         return scanCreator.apply(other());
+    }
+
+    /**
+     * Returns the primary-key comparator of the snapshot branch. It is used by batch scans to split
+     * each bucket's snapshot and delta files into key-range splits. Both branches share the same
+     * primary-key schema, so the snapshot branch's comparator correctly orders keys from either
+     * branch.
+     */
+    Comparator<InternalRow> chainKeyComparator() {
+        return ((PrimaryKeyFileStoreTable) wrapped).store().newKeyComparator();
     }
 
     @Override
@@ -336,6 +346,17 @@ public class ChainGroupReadTable extends FallbackReadFileStoreTable {
             PredicateBuilder builder = new PredicateBuilder(tableSchema.logicalPartitionType());
             Set<BinaryRow> snapshotPartitions = preloadTargetSnapshotSplits(splits);
 
+            // Key-range splitting parameters are loop-invariant; compute them once. When key-range
+            // splitting is enabled, each bucket's snapshot and delta files are split into multiple
+            // splits to improve read parallelism (files with intersecting key ranges stay
+            // together).
+            Comparator<InternalRow> keyComparator =
+                    options.chainTableKeyRangeSplitEnabled()
+                            ? chainGroupReadTable.chainKeyComparator()
+                            : null;
+            long targetSplitSize = options.splitTargetSize();
+            long openFileCost = options.splitOpenFileCost();
+
             DataTableScan deltaPartitionScan =
                     newChainPartitionListingScan(false, getFallbackPartitionPredicate());
             List<BinaryRow> deltaPartitions =
@@ -449,7 +470,10 @@ public class ChainGroupReadTable extends FallbackReadFileStoreTable {
                                         snapshotSubSplits,
                                         deltaSubSplits,
                                         options.scanFallbackSnapshotBranch(),
-                                        options.scanFallbackDeltaBranch()));
+                                        options.scanFallbackDeltaBranch(),
+                                        keyComparator,
+                                        targetSplitSize,
+                                        openFileCost));
                     }
                 }
             }
@@ -495,18 +519,7 @@ public class ChainGroupReadTable extends FallbackReadFileStoreTable {
 
             for (Split split : mainScan.plan().splits()) {
                 DataSplit dataSplit = (DataSplit) split;
-                HashMap<String, String> fileBucketPathMapping = new HashMap<>();
-                HashMap<String, String> fileBranchMapping = new HashMap<>();
-                for (DataFileMeta file : dataSplit.dataFiles()) {
-                    fileBucketPathMapping.put(file.fileName(), ((DataSplit) split).bucketPath());
-                    fileBranchMapping.put(file.fileName(), options.scanFallbackSnapshotBranch());
-                }
-                splits.add(
-                        new ChainSplit(
-                                dataSplit.partition(),
-                                dataSplit.dataFiles(),
-                                fileBranchMapping,
-                                fileBucketPathMapping));
+                splits.add(ChainSplit.from(dataSplit, options.scanFallbackSnapshotBranch()));
             }
 
             snapshotPartitions.addAll(

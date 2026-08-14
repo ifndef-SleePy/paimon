@@ -53,7 +53,7 @@ import org.apache.paimon.operation.commit.ManifestEntryChanges;
 import org.apache.paimon.operation.commit.RetryCommitResult;
 import org.apache.paimon.operation.commit.RetryCommitResult.CommitFailRetryResult;
 import org.apache.paimon.operation.commit.RetryCommitResult.ManifestMergeResult;
-import org.apache.paimon.operation.commit.RowIdColumnConflictChecker;
+import org.apache.paimon.operation.commit.RowIdConflictChecker;
 import org.apache.paimon.operation.commit.RowTrackingCommitUtils.RowTrackingAssigned;
 import org.apache.paimon.operation.commit.StrictModeChecker;
 import org.apache.paimon.operation.commit.SuccessCommitResult;
@@ -106,6 +106,7 @@ import java.util.stream.Collectors;
 
 import static java.util.Collections.emptyList;
 import static org.apache.paimon.deletionvectors.DeletionVectorsIndexFile.DELETION_VECTORS_INDEX;
+import static org.apache.paimon.format.blob.BlobFileFormat.isBlobFile;
 import static org.apache.paimon.manifest.ManifestEntry.nullableRecordCount;
 import static org.apache.paimon.manifest.ManifestEntry.recordCountAdd;
 import static org.apache.paimon.manifest.ManifestEntry.recordCountDelete;
@@ -113,6 +114,7 @@ import static org.apache.paimon.operation.commit.ManifestEntryChanges.changedPar
 import static org.apache.paimon.operation.commit.RowTrackingCommitUtils.assignRowTracking;
 import static org.apache.paimon.partition.PartitionPredicate.createBinaryPartitions;
 import static org.apache.paimon.partition.PartitionPredicate.createPartitionPredicate;
+import static org.apache.paimon.types.VectorType.isVectorStoreFile;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
@@ -228,6 +230,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                                                 commitUser,
                                                 scanSupplier,
                                                 indexManifestFile,
+                                                options.dataEvolutionEnabled(),
                                                 id))
                         .orElse(null);
         this.conflictDetection = conflictDetectFactory.create(scanner);
@@ -261,6 +264,14 @@ public class FileStoreCommitImpl implements FileStoreCommit {
     @Override
     public FileStoreCommit rowIdCheckConflict(@Nullable Long rowIdCheckFromSnapshot) {
         this.conflictDetection.setRowIdCheckFromSnapshot(rowIdCheckFromSnapshot);
+        return this;
+    }
+
+    @Override
+    public FileStoreCommit rowIdCheckConflictForMaterializeDvCompaction(
+            @Nullable Long rowIdCheckFromSnapshot) {
+        this.conflictDetection.setRowIdCheckFromSnapshotForMaterializeDvCompaction(
+                rowIdCheckFromSnapshot);
         return this;
     }
 
@@ -326,7 +337,9 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         int generatedSnapshot = 0;
         int attempts = 0;
 
-        ManifestEntryChanges changes = collectChanges(committable.fileCommittables());
+        List<CommitMessage> commitMessages = committable.fileCommittables();
+        ManifestEntryChanges changes = collectChanges(commitMessages);
+        Set<Pair<BinaryRow, Integer>> materializedBuckets = materializedBuckets(commitMessages);
         try {
             List<SimpleFileEntry> appendSimpleEntries =
                     SimpleFileEntry.from(changes.appendTableFiles);
@@ -346,7 +359,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                     checkAppendFiles = true;
                     allowRollback = true;
                 }
-                if (conflictDetection.hasRowIdCheckFromSnapshot()) {
+                if (conflictDetection.shouldCheckRowIdFromSnapshot(commitKind)) {
                     checkAppendFiles = true;
                     allowRollback = true;
                 }
@@ -379,10 +392,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                     || !changes.compactIndexFiles.isEmpty()) {
                 attempts +=
                         tryCommit(
-                                CommitChangesProvider.provider(
-                                        changes.compactTableFiles,
-                                        changes.compactChangelog,
-                                        changes.compactIndexFiles),
+                                compactChangesProvider(changes, materializedBuckets),
                                 committable.identifier(),
                                 committable.watermark(),
                                 committable.properties(),
@@ -451,21 +461,44 @@ public class FileStoreCommitImpl implements FileStoreCommit {
     }
 
     @Override
-    public int overwritePartition(
-            Map<String, String> partition,
-            ManifestCommittable committable,
-            Map<String, String> properties) {
+    public int overwritePartition(Map<String, String> partition, ManifestCommittable committable) {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Ready to overwrite partition {}\nManifestCommittable: {}",
+                    partition,
+                    committable);
+        }
+        return overwritePartition(
+                () -> {
+                    Predicate partitionPredicate =
+                            createPartitionPredicate(
+                                    partition, partitionType, options.partitionDefaultName());
+                    return PartitionPredicate.fromPredicate(partitionType, partitionPredicate);
+                },
+                committable);
+    }
+
+    @Override
+    public int overwriteStaticPartitions(
+            List<BinaryRow> staticPartitions, ManifestCommittable committable) {
+        checkArgument(!staticPartitions.isEmpty(), "Partitions list cannot be empty.");
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "Ready to overwrite partitions {}\nManifestCommittable: {}",
+                    staticPartitions,
+                    committable);
+        }
+        return overwritePartition(
+                () -> PartitionPredicate.fromMultiple(partitionType, staticPartitions),
+                committable);
+    }
+
+    private int overwritePartition(
+            Supplier<PartitionPredicate> staticPartitionFilter, ManifestCommittable committable) {
         LOG.info(
                 "Ready to overwrite to table {}, number of commit messages: {}",
                 tableName,
                 committable.fileCommittables().size());
-        if (LOG.isDebugEnabled()) {
-            LOG.debug(
-                    "Ready to overwrite partition {}\nManifestCommittable: {}\nProperties: {}",
-                    partition,
-                    committable,
-                    properties);
-        }
 
         long started = System.nanoTime();
         int generatedSnapshot = 0;
@@ -490,7 +523,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
 
         try {
             boolean skipOverwrite = false;
-            // partition filter is built from static or dynamic partition according to properties
+            // partition filter is built from static or dynamic partitions
             PartitionPredicate partitionFilter = null;
             if (partitionType.getFieldCount() > 0 && options.dynamicPartitionOverwrite()) {
                 if (changes.appendTableFiles.isEmpty()) {
@@ -504,20 +537,13 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                     partitionFilter = PartitionPredicate.fromMultiple(partitionType, partitions);
                 }
             } else {
-                // partition may be partial partition fields, so here must use predicate way.
-                Predicate partitionPredicate =
-                        createPartitionPredicate(
-                                partition, partitionType, options.partitionDefaultName());
-                partitionFilter =
-                        PartitionPredicate.fromPredicate(partitionType, partitionPredicate);
+                partitionFilter = staticPartitionFilter.get();
                 // sanity check, all changes must be done within the given partition
                 if (partitionFilter != null) {
                     for (ManifestEntry entry : changes.appendTableFiles) {
                         if (!partitionFilter.test(entry.partition())) {
                             throw new IllegalArgumentException(
-                                    "Trying to overwrite partition "
-                                            + partition
-                                            + ", but the changes in "
+                                    "The changes in "
                                             + pathFactory.getPartitionString(entry.partition())
                                             + " does not belong to this partition");
                         }
@@ -737,6 +763,69 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         return changes;
     }
 
+    private Set<Pair<BinaryRow, Integer>> materializedBuckets(List<CommitMessage> commitMessages) {
+        if (!options.dataEvolutionEnabled() || !options.deletionVectorsEnabled()) {
+            return Collections.emptySet();
+        }
+
+        Set<Pair<BinaryRow, Integer>> result = new HashSet<>();
+        for (CommitMessage message : commitMessages) {
+            CommitMessageImpl commitMessage = (CommitMessageImpl) message;
+            if (commitMessage.compactIncrement().compactBefore().stream()
+                            .noneMatch(
+                                    file ->
+                                            !isBlobFile(file.fileName())
+                                                    && !isVectorStoreFile(file.fileName()))
+                    || commitMessage.compactIncrement().compactAfter().stream()
+                            .anyMatch(file -> file.firstRowId() != null)) {
+                continue;
+            }
+            result.add(Pair.of(commitMessage.partition(), commitMessage.bucket()));
+        }
+        return result;
+    }
+
+    @VisibleForTesting
+    CommitChangesProvider compactChangesProvider(
+            ManifestEntryChanges changes, Set<Pair<BinaryRow, Integer>> materializedBuckets) {
+        if (materializedBuckets.isEmpty()) {
+            return CommitChangesProvider.provider(
+                    changes.compactTableFiles, changes.compactChangelog, changes.compactIndexFiles);
+        }
+
+        return latestSnapshot -> {
+            List<IndexManifestEntry> indexFiles =
+                    changes.compactIndexFiles.stream()
+                            // Replace global-index deletions prepared against an older snapshot.
+                            .filter(
+                                    entry ->
+                                            entry.kind() != FileKind.DELETE
+                                                    || entry.indexFile().globalIndexMeta() == null
+                                                    || !materializedBuckets.contains(
+                                                            Pair.of(
+                                                                    entry.partition(),
+                                                                    entry.bucket())))
+                            .collect(Collectors.toList());
+
+            // This provider is invoked again after every optimistic-commit conflict. Scanning the
+            // latest snapshot here guarantees that an index committed concurrently is either
+            // deleted by this attempt or makes this attempt retry and is deleted by the next one.
+            if (latestSnapshot != null && latestSnapshot.indexManifest() != null) {
+                for (IndexManifestEntry entry :
+                        indexManifestFile.read(latestSnapshot.indexManifest())) {
+                    if (entry.indexFile().globalIndexMeta() != null
+                            && materializedBuckets.contains(
+                                    Pair.of(entry.partition(), entry.bucket()))) {
+                        indexFiles.add(entry.toDeleteEntry());
+                    }
+                }
+            }
+
+            return new CommitChanges(
+                    changes.compactTableFiles, changes.compactChangelog, indexFiles);
+        };
+    }
+
     private int tryCommit(
             CommitChangesProvider changesProvider,
             long identifier,
@@ -788,14 +877,14 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         return retryCount + 1;
     }
 
-    private void checkSameBucketFromSnapshot(
+    private void checkSameFixedBucketFromSnapshot(
             List<ManifestEntry> deltaFiles, @Nullable Snapshot latestSnapshot) {
         if (latestSnapshot == null) {
             return;
         }
 
         Map<BinaryRow, Integer> expectedTotalBuckets =
-                conflictDetection.collectUncheckedBucketPartitions(deltaFiles);
+                conflictDetection.collectUncheckedFixedBucketPartitions(deltaFiles);
         if (expectedTotalBuckets.isEmpty()) {
             return;
         }
@@ -804,14 +893,14 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                 scanner.readTotalBuckets(
                         latestSnapshot, new ArrayList<>(expectedTotalBuckets.keySet()));
         Optional<RuntimeException> exception =
-                conflictDetection.checkSameBucketByTotalBuckets(
+                conflictDetection.checkSameFixedBucketByTotalBuckets(
                         expectedTotalBuckets, previousTotalBuckets);
         if (exception.isPresent()) {
             throw exception.get();
         }
     }
 
-    private boolean shouldCheckSameBucket(CommitKind commitKind) {
+    private boolean shouldCheckSameFixedBucket(CommitKind commitKind) {
         return commitKind == CommitKind.APPEND
                 && bucketMode == BucketMode.HASH_FIXED
                 && (isUnorderedWriteOnlyAppend() || isWriteOnlySnapshotSequenceAppend());
@@ -924,6 +1013,10 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             }
         }
 
+        if (latestSnapshot == null) {
+            conflictDetection.checkSameBucketWithinDelta(deltaFiles);
+        }
+
         List<BinaryRow> changedPartitions = null;
         if (strictModeChecker != null) {
             changedPartitions = changedPartitions(deltaFiles, indexFiles);
@@ -948,8 +1041,8 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         boolean checkConflicts = latestSnapshot != null && (discardDuplicate || detectConflicts);
         // By default, if checkConflicts is required, we do not have to do the extra check bucket
         // here.
-        if (!checkConflicts && shouldCheckSameBucket(commitKind)) {
-            checkSameBucketFromSnapshot(deltaFiles, latestSnapshot);
+        if (!checkConflicts && shouldCheckSameFixedBucket(commitKind)) {
+            checkSameFixedBucketFromSnapshot(deltaFiles, latestSnapshot);
         }
         if (checkConflicts) {
             // latestSnapshotId is different from the snapshot id we've checked for conflicts,
@@ -961,25 +1054,15 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                     retryResult instanceof CommitFailRetryResult
                             ? (CommitFailRetryResult) retryResult
                             : null;
-            // An overwrite may replace the base manifest list without recording the replacements
-            // in its delta manifest, so the cached base cannot always be refreshed incrementally.
-            if (commitFailRetry != null
-                    && commitFailRetry.latestSnapshot != null
-                    && commitFailRetry.baseDataFiles != null
-                    && !hasOverwriteSinceLastAttempt) {
-                baseDataFiles = new ArrayList<>(commitFailRetry.baseDataFiles);
-                List<SimpleFileEntry> incremental =
-                        scanner.readIncrementalChanges(
-                                commitFailRetry.latestSnapshot, latestSnapshot, changedPartitions);
-                if (!incremental.isEmpty()) {
-                    baseDataFiles.addAll(incremental);
-                    baseDataFiles = new ArrayList<>(FileEntry.mergeEntries(baseDataFiles));
-                }
-            } else {
-                baseDataFiles =
-                        scanner.readAllEntriesFromChangedPartitions(
-                                latestSnapshot, changedPartitions);
-            }
+            baseDataFiles =
+                    conflictDetection.scanBaseDataFiles(
+                            latestSnapshot,
+                            changedPartitions,
+                            deltaFiles,
+                            indexFiles,
+                            commitKind,
+                            commitFailRetry,
+                            hasOverwriteSinceLastAttempt);
             if (discardDuplicate) {
                 Set<FileEntry.Identifier> baseIdentifiers =
                         baseDataFiles.stream()
@@ -990,22 +1073,16 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                                 .filter(entry -> !baseIdentifiers.contains(entry.identifier()))
                                 .collect(Collectors.toList());
             }
-            RowIdColumnConflictChecker rowIdColumnConflictChecker = null;
-            if (conflictDetection.hasRowIdCheckFromSnapshot()) {
-                rowIdColumnConflictChecker =
-                        RowIdColumnConflictChecker.fromDataFiles(
-                                schemaManager,
-                                deltaFiles.stream()
-                                        .map(ManifestEntry::file)
-                                        .collect(Collectors.toList()));
-            }
+            RowIdConflictChecker rowIdConflictChecker =
+                    conflictDetection.createRowIdConflictChecker(
+                            schemaManager, deltaFiles, commitKind);
             Optional<RuntimeException> exception =
                     conflictDetection.checkConflicts(
                             latestSnapshot,
                             baseDataFiles,
                             SimpleFileEntry.from(deltaFiles),
                             indexFiles,
-                            rowIdColumnConflictChecker,
+                            rowIdConflictChecker,
                             commitKind);
             if (exception.isPresent()) {
                 if (allowRollback && rollback != null) {
@@ -1185,7 +1262,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                 callback ->
                         callback.call(finalBaseFiles, finalDeltaFiles, indexFiles, newSnapshot));
         try {
-            success = commitSnapshotImpl(newSnapshot, deltaStatistics);
+            success = commitSnapshotImpl(latestSnapshot, newSnapshot, deltaStatistics);
         } catch (Exception e) {
             // commit exception, not sure about the situation and should not clean up the files
             LOG.warn("Retry commit for exception.", e);
@@ -1320,7 +1397,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                         nextRowId,
                         null);
 
-        return commitSnapshotImpl(newSnapshot, emptyList());
+        return commitSnapshotImpl(latest, newSnapshot, emptyList());
     }
 
     @Override
@@ -1402,7 +1479,8 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                         targetSnapshot.watermark(),
                         targetSnapshot.statistics(),
                         targetSnapshot.properties(),
-                        nextRowId);
+                        nextRowId,
+                        null);
 
         // The rollback is an overwrite from the previous latest to the target, so the base files,
         // delta files and index changes describe the transition the callbacks need. These are
@@ -1419,7 +1497,8 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                 callback -> callback.call(baseFiles, deltaFiles, indexChanges, newSnapshot));
 
         boolean success =
-                commitSnapshotImpl(newSnapshot, new ArrayList<>(PartitionEntry.merge(deltaFiles)));
+                commitSnapshotImpl(
+                        latest, newSnapshot, new ArrayList<>(PartitionEntry.merge(deltaFiles)));
         if (success) {
             // Notify the post-commit callbacks so external views stay in sync with the rolled-back
             // state (e.g. Iceberg compatibility metadata and chain-table overwrite handling).
@@ -1555,16 +1634,23 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                         latestSnapshot.nextRowId(),
                         null);
 
-        return commitSnapshotImpl(newSnapshot, emptyList());
+        return commitSnapshotImpl(latestSnapshot, newSnapshot, emptyList());
     }
 
-    private boolean commitSnapshotImpl(Snapshot newSnapshot, List<PartitionEntry> deltaStatistics) {
+    private boolean commitSnapshotImpl(
+            @Nullable Snapshot baseSnapshot,
+            Snapshot newSnapshot,
+            List<PartitionEntry> deltaStatistics) {
         try {
             List<PartitionStatistics> statistics = new ArrayList<>(deltaStatistics.size());
             for (PartitionEntry entry : deltaStatistics) {
                 statistics.add(entry.toPartitionStatistics(partitionComputer));
             }
-            return snapshotCommit.commit(newSnapshot, options.branch(), statistics);
+            return snapshotCommit.commit(
+                    baseSnapshot == null ? null : baseSnapshot.uuid(),
+                    newSnapshot,
+                    options.branch(),
+                    statistics);
         } catch (Throwable e) {
             // exception when performing the atomic rename,
             // we cannot clean up because we can't determine the success

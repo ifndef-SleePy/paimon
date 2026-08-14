@@ -21,8 +21,11 @@ package org.apache.paimon.utils;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.codegen.RecordComparator;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.mergetree.SortedRun;
+import org.apache.paimon.mergetree.compact.IntervalPartition;
 import org.apache.paimon.partition.PartitionTimeExtractor;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
@@ -31,17 +34,24 @@ import org.apache.paimon.table.FallbackReadFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.ChainSplit;
 import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.DeletionFile;
 import org.apache.paimon.types.RowType;
+
+import javax.annotation.Nullable;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -377,6 +387,9 @@ public class ChainTableUtils {
      * originate from the snapshot splits are tagged with {@code snapshotBranch}; all other files
      * are tagged with {@code deltaBranch}.
      *
+     * <p>This overload produces one {@link ChainSplit} per bucket (no key-range splitting). It is
+     * used by streaming read, where splitting a bucket by key range is not desired.
+     *
      * @param logicalPartition the logical partition for the resulting ChainSplits
      * @param snapshotSplits splits from the snapshot branch
      * @param deltaSplits splits from the delta branch
@@ -390,6 +403,49 @@ public class ChainTableUtils {
             List<DataSplit> deltaSplits,
             String snapshotBranch,
             String deltaBranch) {
+        return buildChainSplits(
+                logicalPartition,
+                snapshotSplits,
+                deltaSplits,
+                snapshotBranch,
+                deltaBranch,
+                null,
+                0L,
+                0L);
+    }
+
+    /**
+     * Builds {@link ChainSplit}s from the given snapshot and delta splits, optionally splitting
+     * each bucket's files into multiple splits by key range to improve batch read parallelism.
+     *
+     * <p>When {@code keyComparator} is non-null, each bucket's snapshot and delta files are split
+     * via interval partition: files with intersecting key ranges always go to the same split, so
+     * that all versions of a key across the snapshot and delta branches are merged together within
+     * one split. Key-disjoint sections are then packed into splits up to {@code targetSplitSize}.
+     * This is the same invariant the ordinary primary-key table relies on (see {@link
+     * org.apache.paimon.table.source.MergeTreeSplitGenerator}), except the chain path always goes
+     * through the interval partition because snapshot and delta files from different branches may
+     * have intersecting key ranges.
+     *
+     * <p>When {@code keyComparator} is null, each bucket produces a single {@link ChainSplit} (the
+     * original behavior, used by streaming).
+     *
+     * @param keyComparator primary-key comparator used to order files by min/max key; null disables
+     *     key-range splitting
+     * @param targetSplitSize target size (in bytes) of each split; ignored when {@code
+     *     keyComparator} is null
+     * @param openFileCost per-file open cost accounted for in packing; ignored when {@code
+     *     keyComparator} is null
+     */
+    public static List<ChainSplit> buildChainSplits(
+            BinaryRow logicalPartition,
+            List<DataSplit> snapshotSplits,
+            List<DataSplit> deltaSplits,
+            String snapshotBranch,
+            String deltaBranch,
+            @Nullable Comparator<InternalRow> keyComparator,
+            long targetSplitSize,
+            long openFileCost) {
         Set<String> snapshotFileNames =
                 snapshotSplits.stream()
                         .flatMap(s -> s.dataFiles().stream().map(DataFileMeta::fileName))
@@ -408,26 +464,110 @@ public class ChainTableUtils {
         for (Map.Entry<Integer, List<DataSplit>> entry : bucketSplits.entrySet()) {
             Map<String, String> fileBranchMapping = new HashMap<>();
             Map<String, String> fileBucketPathMapping = new HashMap<>();
-            for (DataSplit ds : entry.getValue()) {
-                for (DataFileMeta file : ds.dataFiles()) {
-                    fileBucketPathMapping.put(file.fileName(), ds.bucketPath());
+            Map<String, DeletionFile> fileDeletionMapping = new HashMap<>();
+            List<DataFileMeta> bucketFiles = new ArrayList<>();
+            for (DataSplit dataSplit : entry.getValue()) {
+                Optional<List<DeletionFile>> deletionFilesOpt = dataSplit.deletionFiles();
+                for (int i = 0; i < dataSplit.dataFiles().size(); i++) {
+                    DataFileMeta file = dataSplit.dataFiles().get(i);
+                    DeletionFile deletionFile =
+                            deletionFilesOpt.isPresent() ? deletionFilesOpt.get().get(i) : null;
+                    fileBucketPathMapping.put(file.fileName(), dataSplit.bucketPath());
                     String branch =
                             snapshotFileNames.contains(file.fileName())
                                     ? snapshotBranch
                                     : deltaBranch;
                     fileBranchMapping.put(file.fileName(), branch);
+                    fileDeletionMapping.put(file.fileName(), deletionFile);
+                    bucketFiles.add(file);
                 }
             }
-            result.add(
-                    new ChainSplit(
-                            logicalPartition,
-                            entry.getValue().stream()
-                                    .flatMap(ds -> ds.dataFiles().stream())
-                                    .collect(Collectors.toList()),
-                            fileBranchMapping,
-                            fileBucketPathMapping));
+
+            List<List<DataFileMeta>> fileGroups;
+            if (keyComparator == null) {
+                fileGroups = Collections.singletonList(bucketFiles);
+            } else {
+                fileGroups =
+                        splitBucketByKeyRange(
+                                bucketFiles, keyComparator, targetSplitSize, openFileCost);
+            }
+
+            for (List<DataFileMeta> groupFiles : fileGroups) {
+                result.add(
+                        new ChainSplit(
+                                logicalPartition,
+                                groupFiles,
+                                subMapping(fileBranchMapping, groupFiles),
+                                subMapping(fileBucketPathMapping, groupFiles),
+                                subDeletionFiles(fileDeletionMapping, groupFiles)));
+            }
         }
         return result;
+    }
+
+    /**
+     * Splits a bucket's files (snapshot + delta combined) into key-range groups. The interval
+     * partition first sorts files by (minKey, maxKey) and groups key-overlapping files into the
+     * same section, guaranteeing all versions of a key stay in one split. Sections are key-disjoint
+     * and key-ordered, so packing consecutive sections up to {@code targetSplitSize} preserves that
+     * invariant.
+     */
+    private static List<List<DataFileMeta>> splitBucketByKeyRange(
+            List<DataFileMeta> files,
+            Comparator<InternalRow> keyComparator,
+            long targetSplitSize,
+            long openFileCost) {
+        List<List<DataFileMeta>> sections = new ArrayList<>();
+        for (List<SortedRun> section : new IntervalPartition(files, keyComparator).partition()) {
+            List<DataFileMeta> sectionFiles = new ArrayList<>();
+            for (SortedRun run : section) {
+                sectionFiles.addAll(run.files());
+            }
+            sections.add(sectionFiles);
+        }
+
+        Function<List<DataFileMeta>, Long> weightFunc =
+                section -> Math.max(totalSize(section), openFileCost);
+        return BinPacking.packForOrdered(sections, weightFunc, targetSplitSize).stream()
+                .map(ChainTableUtils::flatFiles)
+                .collect(Collectors.toList());
+    }
+
+    private static long totalSize(List<DataFileMeta> files) {
+        long size = 0L;
+        for (DataFileMeta file : files) {
+            size += file.fileSize();
+        }
+        return size;
+    }
+
+    private static List<DataFileMeta> flatFiles(List<List<DataFileMeta>> packedSections) {
+        List<DataFileMeta> files = new ArrayList<>();
+        packedSections.forEach(files::addAll);
+        return files;
+    }
+
+    private static Map<String, String> subMapping(
+            Map<String, String> mapping, List<DataFileMeta> files) {
+        Map<String, String> sub = new HashMap<>();
+        for (DataFileMeta file : files) {
+            sub.put(file.fileName(), mapping.get(file.fileName()));
+        }
+        return sub;
+    }
+
+    private static List<DeletionFile> subDeletionFiles(
+            Map<String, DeletionFile> mapping, List<DataFileMeta> files) {
+        boolean hasDeletionFile = false;
+        List<DeletionFile> result = new ArrayList<>(files.size());
+        for (DataFileMeta file : files) {
+            DeletionFile deletionFile = mapping.get(file.fileName());
+            if (deletionFile != null) {
+                hasDeletionFile = true;
+            }
+            result.add(deletionFile);
+        }
+        return hasDeletionFile ? result : null;
     }
 
     private static Integer addToBucketMap(

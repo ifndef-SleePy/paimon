@@ -561,6 +561,21 @@ public class DataEvolutionMergeIntoActionITCase extends ActionITCaseBase {
                 .hasMessageContaining(
                         "MergeInto: update columns contain globally indexed columns, not supported now.");
 
+        // 2. IGNORE should allow the update and leave the index unchanged
+        executeSQL(
+                "ALTER TABLE T SET ('global-index.column-update-action' = 'IGNORE')", false, true);
+
+        assertDoesNotThrow(
+                () ->
+                        executeSQL(
+                                String.format(
+                                        "CALL sys.data_evolution_merge_into('%s.T', '', '', 'S', 'T._ROW_ID=S.id', 'name=S.name,id=1', 2)",
+                                        database),
+                                false,
+                                true));
+
+        assertTrue(indexFileExists("T"));
+
         insertInto(
                 "T",
                 "(31, 'name31', 3.1, '01-23')",
@@ -576,7 +591,7 @@ public class DataEvolutionMergeIntoActionITCase extends ActionITCaseBase {
 
         insertInto("S", "(35, 'new_name25', 125.1)");
 
-        // 2. updating unindexed partitions is not affected
+        // 3. updating unindexed partitions is not affected
         assertDoesNotThrow(
                 () ->
                         executeSQL(
@@ -588,7 +603,7 @@ public class DataEvolutionMergeIntoActionITCase extends ActionITCaseBase {
                                 false,
                                 true));
 
-        // 3. alter table's UpdateAction option to DROP_INDEX
+        // 4. alter table's UpdateAction option to DROP_INDEX
         executeSQL(
                 "ALTER TABLE T SET ('global-index.column-update-action' = 'DROP_PARTITION_INDEX')",
                 false,
@@ -604,6 +619,29 @@ public class DataEvolutionMergeIntoActionITCase extends ActionITCaseBase {
                                 true));
 
         assertFalse(indexFileExists("T"));
+    }
+
+    @Test
+    public void testMergeUnindexedRowWithFastSearchMode() throws Exception {
+        executeSQL(
+                "CALL sys.create_global_index(`table` => 'default.T', "
+                        + "index_column => 'name', index_type => 'btree')",
+                false,
+                true);
+        insertInto("T", "(21, 'new', 2.1, '01-22')");
+        executeSQL("ALTER TABLE T SET ('scalar-index.search-mode' = 'fast')", false, true);
+
+        builder(warehouse, database, "T")
+                .withMergeCondition("T.name = 'new' AND S.id = 21")
+                .withMatchedUpdateSet("T.value = S.`value`")
+                .withSourceTable("S")
+                .withSinkParallelism(1)
+                .build()
+                .run();
+
+        testBatchRead(
+                "SELECT id, name, `value` FROM T WHERE id = 21",
+                Collections.singletonList(changelogRow("+I", 21, "new", 102.1)));
     }
 
     private boolean indexFileExists(String tableName) throws Exception {

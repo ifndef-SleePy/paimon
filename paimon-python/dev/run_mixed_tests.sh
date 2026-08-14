@@ -98,6 +98,7 @@ run_batched_java_write_tests() {
     local result=0
 
     local core_tests="org.apache.paimon.JavaPyE2ETest#testJavaWriteReadPkTable"
+    core_tests="${core_tests}+testJavaWriteDynamicBucketHashIndex"
     core_tests="${core_tests}+testPKDeletionVectorWrite"
     core_tests="${core_tests}+testBtreeIndexWrite"
     core_tests="${core_tests}+testBtreeRawFallbackWrite"
@@ -136,7 +137,7 @@ run_batched_java_write_tests() {
         fi
     fi
 
-    if [[ "$PYTHON_MINOR" -ge 10 ]]; then
+    if [[ "$PYTHON_MINOR" -ge 8 ]]; then
         if ! run_maven_test_batch \
             "paimon-full-text Java write tests" \
             "paimon-full-text" \
@@ -185,7 +186,7 @@ run_java_write_test() {
     echo "Running Maven test for JavaPyE2ETest.testJavaWriteReadPkTable (Parquet/Orc/Avro)..."
     echo "Note: Maven may download dependencies on first run, this may take a while..."
     local parquet_result=0
-    if mvn test -Dtest=org.apache.paimon.JavaPyE2ETest#testJavaWriteReadPkTable -pl paimon-core -Drun.e2e.tests=true; then
+    if mvn test -Dtest=org.apache.paimon.JavaPyE2ETest#testJavaWriteReadPkTable+testJavaWriteDynamicBucketHashIndex -pl paimon-core -Drun.e2e.tests=true; then
         echo -e "${GREEN}✓ Java write Parquet/Orc/Avro test completed successfully${NC}"
     else
         echo -e "${RED}✗ Java write Parquet/Orc/Avro test failed${NC}"
@@ -223,7 +224,7 @@ run_python_read_test() {
 
     # Run the parameterized Python test method (runs for both Parquet/Orc/Avro and Lance)
     echo "Running Python test for JavaPyReadWriteTest.test_read_pk_table..."
-    if python -m pytest java_py_read_write_test.py::JavaPyReadWriteTest -k "test_read_pk_table" -v; then
+    if python -m pytest java_py_read_write_test.py::JavaPyReadWriteTest -k "test_read_pk_table or test_read_java_dynamic_bucket_hash_index" -v; then
         echo -e "${GREEN}✓ Python test completed successfully${NC}"
 #        source deactivate
         return 0
@@ -242,7 +243,7 @@ run_python_write_test() {
 
     # Run the parameterized Python test method for writing data (pk table, includes bucket num assertion)
     echo "Running Python test for JavaPyReadWriteTest (test_py_write_read_pk_table)..."
-    if python -m pytest java_py_read_write_test.py::JavaPyReadWriteTest -k "test_py_write_read_pk_table" -v; then
+    if python -m pytest java_py_read_write_test.py::JavaPyReadWriteTest -k "test_py_write_read_pk_table or test_py_write_dynamic_bucket_hash_index" -v; then
         echo -e "${GREEN}✓ Python write test completed successfully${NC}"
         return 0
     else
@@ -261,7 +262,7 @@ run_java_read_test() {
     echo "Running Maven test for JavaPyE2ETest.testReadPkTable (Java Read Parquet/Orc/Avro)..."
     echo "Note: Maven may download dependencies on first run, this may take a while..."
     local parquet_result=0
-    if mvn test -Dtest=org.apache.paimon.JavaPyE2ETest#testReadPkTable -pl paimon-core -Drun.e2e.tests=true -Dpython.version="$PYTHON_VERSION"; then
+    if mvn test -Dtest=org.apache.paimon.JavaPyE2ETest#testReadPkTable+testReadPythonDynamicBucketHashIndex -pl paimon-core -Drun.e2e.tests=true -Dpython.version="$PYTHON_VERSION"; then
         echo -e "${GREEN}✓ Java read Parquet/Orc/Avro test completed successfully${NC}"
     else
         echo -e "${RED}✗ Java read Parquet/Orc/Avro test failed${NC}"
@@ -659,14 +660,14 @@ ensure_paimon_vindex() {
     fi
 
     echo "Installing Python paimon-vindex dependency..."
-    if python -m pip install 'paimon-vindex==0.1.0'; then
+    if python -m pip install 'paimon-vindex==0.3.0'; then
         return 0
     fi
 
     echo -e "${YELLOW}Direct pip install failed; installing paimon-vindex into a temporary target directory...${NC}"
     local target_dir="${TMPDIR:-/tmp}/paimon-vindex-site"
     rm -rf "$target_dir"
-    if python -m pip install --target "$target_dir" 'paimon-vindex==0.1.0'; then
+    if python -m pip install --target "$target_dir" 'paimon-vindex==0.3.0'; then
         export PYTHONPATH="$target_dir:${PYTHONPATH:-}"
         return 0
     fi
@@ -674,7 +675,7 @@ ensure_paimon_vindex() {
     if python -c "import numpy" >/dev/null 2>&1; then
         echo -e "${YELLOW}Dependency install failed but numpy is already available; retrying paimon-vindex without dependencies...${NC}"
         rm -rf "$target_dir"
-        if python -m pip install --target "$target_dir" --no-deps 'paimon-vindex==0.1.0'; then
+        if python -m pip install --target "$target_dir" --no-deps 'paimon-vindex==0.3.0'; then
             export PYTHONPATH="$target_dir:${PYTHONPATH:-}"
             return 0
         fi
@@ -974,40 +975,40 @@ run_array_blob_interop_test() {
 }
 
 run_map_blob_interop_test() {
-    echo -e "${YELLOW}=== Running MAP<INT, BLOB> Test (Java Write → Python Read, Python Write → Java Read) ===${NC}"
+    echo -e "${YELLOW}=== Running MAP<K, BLOB> Test (Java Write → Python Read, Python Write → Java Read) ===${NC}"
 
     if ! skip_batched_java_write; then
         cd "$PROJECT_ROOT"
         echo "Running Maven test for JavaPyE2ETest.testJavaWriteMapBlobTable..."
         if ! mvn test -Dtest=org.apache.paimon.JavaPyE2ETest#testJavaWriteMapBlobTable -pl paimon-core -q -Drun.e2e.tests=true; then
-            echo -e "${RED}✗ Java MAP<INT, BLOB> write test failed${NC}"
+            echo -e "${RED}✗ Java MAP<K, BLOB> write test failed${NC}"
             return 1
         fi
-        echo -e "${GREEN}✓ Java MAP<INT, BLOB> write test completed successfully${NC}"
+        echo -e "${GREEN}✓ Java MAP<K, BLOB> write test completed successfully${NC}"
     fi
 
     cd "$PAIMON_PYTHON_DIR"
-    echo "Running Python MAP<INT, BLOB> read test..."
+    echo "Running Python MAP<K, BLOB> read test..."
     if ! python -m pytest java_py_read_write_test.py::JavaPyReadWriteTest::test_read_map_blob_written_by_java -v; then
-        echo -e "${RED}✗ Python MAP<INT, BLOB> read test failed${NC}"
+        echo -e "${RED}✗ Python MAP<K, BLOB> read test failed${NC}"
         return 1
     fi
-    echo -e "${GREEN}✓ Python MAP<INT, BLOB> read test completed successfully${NC}"
+    echo -e "${GREEN}✓ Python MAP<K, BLOB> read test completed successfully${NC}"
 
-    echo "Running Python MAP<INT, BLOB> write test..."
+    echo "Running Python MAP<K, BLOB> write test..."
     if ! python -m pytest java_py_read_write_test.py::JavaPyReadWriteTest::test_write_map_blob_for_java -v; then
-        echo -e "${RED}✗ Python MAP<INT, BLOB> write test failed${NC}"
+        echo -e "${RED}✗ Python MAP<K, BLOB> write test failed${NC}"
         return 1
     fi
-    echo -e "${GREEN}✓ Python MAP<INT, BLOB> write test completed successfully${NC}"
+    echo -e "${GREEN}✓ Python MAP<K, BLOB> write test completed successfully${NC}"
 
     cd "$PROJECT_ROOT"
     echo "Running Maven test for JavaPyE2ETest.testJavaReadMapBlobTable..."
     if ! mvn test -Dtest=org.apache.paimon.JavaPyE2ETest#testJavaReadMapBlobTable -pl paimon-core -q -Drun.e2e.tests=true; then
-        echo -e "${RED}✗ Java MAP<INT, BLOB> read test failed${NC}"
+        echo -e "${RED}✗ Java MAP<K, BLOB> read test failed${NC}"
         return 1
     fi
-    echo -e "${GREEN}✓ Java MAP<INT, BLOB> read test completed successfully${NC}"
+    echo -e "${GREEN}✓ Java MAP<K, BLOB> read test completed successfully${NC}"
 }
 
 # Function to run VARIANT test (Java write, Python read)
@@ -1287,13 +1288,13 @@ main() {
 
     echo ""
 
-    # Run native full-text index test (requires Python >= 3.10)
-    if [[ "$PYTHON_MINOR" -ge 10 ]]; then
+    # Run native full-text index test (requires Python >= 3.8)
+    if [[ "$PYTHON_MINOR" -ge 8 ]]; then
         if ! run_native_fulltext_test; then
             native_fulltext_result=1
         fi
     else
-        echo -e "${YELLOW}⏭ Skipping Native Full-Text Index Test (requires Python >= 3.10, current: $PYTHON_VERSION)${NC}"
+        echo -e "${YELLOW}⏭ Skipping Native Full-Text Index Test (requires Python >= 3.8, current: $PYTHON_VERSION)${NC}"
         native_fulltext_result=0
     fi
 
@@ -1567,9 +1568,9 @@ main() {
     fi
 
     if [[ $map_blob_interop_result -eq 0 ]]; then
-        echo -e "${GREEN}✓ MAP<INT, BLOB> Interoperability Test (Java ↔ Python): PASSED${NC}"
+        echo -e "${GREEN}✓ MAP<K, BLOB> Interoperability Test (Java ↔ Python): PASSED${NC}"
     else
-        echo -e "${RED}✗ MAP<INT, BLOB> Interoperability Test (Java ↔ Python): FAILED${NC}"
+        echo -e "${RED}✗ MAP<K, BLOB> Interoperability Test (Java ↔ Python): FAILED${NC}"
     fi
 
     if [[ $data_evolution_result -eq 0 ]]; then
